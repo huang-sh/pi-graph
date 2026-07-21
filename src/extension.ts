@@ -16,7 +16,9 @@ import { discoverGraphs, findGraph } from "./discovery.ts";
 import { GraphEngine } from "./engine.ts";
 import { PiNodeExecutor } from "./pi-executor.ts";
 import type {
+	Condition,
 	CheckpointSnapshot,
+	GraphDefinition,
 	GraphRunEvent,
 	GraphRunResult,
 	GraphScope,
@@ -440,6 +442,26 @@ async function handleCommand(
 		return;
 	}
 
+	if (action === "visualize") {
+		if (!rest) throw new Error("Usage: /pi-graph visualize <graph>");
+		const discovery = discoverGraphs({
+			cwd: ctx.cwd,
+			agentDir: getAgentDir(),
+			configDirName: CONFIG_DIR_NAME,
+			scope: "both",
+			projectTrusted: ctx.isProjectTrusted(),
+		});
+		const graph = findGraph(discovery, rest);
+		const compiled = compileGraph(graph.definition);
+		const mermaid = generateMermaid(graph.definition);
+		const errorCount = compiled.diagnostics.filter((item) => item.level === "error").length;
+		const header = errorCount > 0
+			? `${graph.name} — ⚠ ${errorCount} compile error(s); rendering structure anyway`
+			: `${graph.name} — ${Object.keys(graph.definition.nodes).length} nodes · ${graph.definition.edges?.length ?? 0} edges · ${graph.definition.routes?.length ?? 0} routes`;
+		ctx.ui.notify(`${header}\n\n\`\`\`mermaid\n${mermaid}\n\`\`\``, "info");
+		return;
+	}
+
 	if (action === "inspect") {
 		if (rest) {
 			const snapshot = await checkpointStore.load(rest);
@@ -486,7 +508,7 @@ async function handleCommand(
 		return;
 	}
 
-	throw new Error("Usage: /pi-graph [list|validate [graph]|run <graph> [input]|resume <runId> [value]|inspect [runId]]");
+	throw new Error("Usage: /pi-graph [list|validate [graph]|run <graph> [input]|resume <runId> [value]|inspect [runId]|visualize <graph>]");
 }
 
 function splitFirst(text: string): [string, string] {
@@ -496,13 +518,14 @@ function splitFirst(text: string): [string, string] {
 	return [trimmed.slice(0, index), trimmed.slice(index).trim()];
 }
 
-const PI_GRAPH_ACTIONS = ["list", "validate", "run", "resume", "inspect"] as const;
+const PI_GRAPH_ACTIONS = ["list", "validate", "run", "resume", "inspect", "visualize"] as const;
 const PI_GRAPH_ACTION_DESCRIPTIONS: Record<string, string> = {
 	list: "List discovered graphs",
 	validate: "Validate a graph (or all)",
 	run: "Run a graph with a task",
 	resume: "Resume an interrupted run",
 	inspect: "Inspect a run checkpoint or list recent runs",
+	visualize: "Render a graph as a Mermaid diagram",
 };
 
 function completeActions(prefix: string): AutocompleteItem[] {
@@ -556,7 +579,7 @@ async function resolvePiGraphCompletions(
 	}
 	const action = trimmed.slice(0, spaceIndex);
 	const rest = trimmed.slice(spaceIndex + 1).trimStart();
-	if (action === "run" || action === "validate") {
+	if (action === "run" || action === "validate" || action === "visualize") {
 		const items = completeUserGraphNames(agentDir, rest);
 		return items.length > 0 ? items : null;
 	}
@@ -607,6 +630,77 @@ function renderGraphResult(details: GraphToolDetails | undefined, expanded: bool
 		return new Text(text, 0, 0);
 	}
 	return new Text("", 0, 0);
+}
+
+const MERMAID_OP: Record<string, string> = {
+	eq: "==",
+	ne: "!=",
+	gt: ">",
+	gte: "≥",
+	lt: "<",
+	lte: "≤",
+	exists: "exists",
+	truthy: "truthy",
+	includes: "includes",
+	matches: "matches",
+};
+
+function conditionLabel(cond: Condition): string {
+	if ("all" in cond) return cond.all.map(conditionLabel).join(" ∧ ");
+	if ("any" in cond) return cond.any.map(conditionLabel).join(" ∨ ");
+	if ("not" in cond) return "¬" + conditionLabel(cond.not);
+	const op = MERMAID_OP[cond.op] ?? cond.op;
+	const valuePart = cond.value === undefined ? "" : ` ${JSON.stringify(cond.value)}`;
+	return `${cond.path} ${op}${valuePart}`;
+}
+
+export function generateMermaid(def: GraphDefinition): string {
+	const lines: string[] = ["flowchart LR"];
+	const referenced = new Set<string>();
+	const edgeLines: string[] = [];
+	for (const edge of def.edges ?? []) {
+		const froms = Array.isArray(edge.from) ? edge.from : [edge.from];
+		const tos = Array.isArray(edge.to) ? edge.to : [edge.to];
+		for (const from of froms) {
+			for (const to of tos) {
+				edgeLines.push(`  ${from} --> ${to}`);
+				referenced.add(from);
+				referenced.add(to);
+			}
+		}
+	}
+	for (const route of def.routes ?? []) {
+		for (const routeCase of route.cases) {
+			const label = conditionLabel(routeCase.when).replace(/"/g, "'");
+			const tos = Array.isArray(routeCase.to) ? routeCase.to : [routeCase.to];
+			for (const to of tos) {
+				edgeLines.push(`  ${route.from} -. "${label}" .-> ${to}`);
+				referenced.add(route.from);
+				referenced.add(to);
+			}
+		}
+		if (route.default !== undefined) {
+			const tos = Array.isArray(route.default) ? route.default : [route.default];
+			for (const to of tos) {
+				edgeLines.push(`  ${route.from} -. "else" .-> ${to}`);
+				referenced.add(route.from);
+				referenced.add(to);
+			}
+		}
+	}
+	for (const [id, node] of Object.entries(def.nodes)) {
+		const decl = node.type === "human" ? `${id}{${id}}` : node.type === "set" ? `${id}[[${id}]]` : `${id}([${id}])`;
+		lines.push(`  ${decl}`);
+	}
+	if (referenced.has("__end__")) lines.push("  __end__((end))");
+	lines.push(...edgeLines);
+	const entry = Array.isArray(def.entry) ? def.entry : def.entry ? [def.entry] : [];
+	const entryIds = entry.filter((id) => def.nodes[id]);
+	if (entryIds.length > 0) {
+		lines.push("  classDef entry stroke:#2a2,stroke-width:3px;");
+		lines.push(`  class ${entryIds.join(",")} entry;`);
+	}
+	return lines.join("\n");
 }
 
 function formatEvent(event: GraphRunEvent): string {

@@ -445,6 +445,7 @@ Command：
 /pi-graph run <graph> [task or JSON object]
 /pi-graph resume <runId> [value or JSON]
 /pi-graph inspect [runId]
+/pi-graph visualize <graph>
 ```
 
 ## 开发与验证
