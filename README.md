@@ -31,6 +31,7 @@
 - durable checkpoint、失败恢复、人工 interrupt/resume
 - graph/node 级 step、node-run、并发、token、cost、timeout、output 和 state-size 硬上限
 - 项目图 trust gate、mutating-tool confirmation、非交互执行策略
+- 图可视化：`/pi-graph visualize` 把任意已发现图渲染成 Mermaid 流程图
 - Pi tools：`pi_graph_run`、`pi_graph_resume`、`pi_graph_inspect`
 - Pi command：`/pi-graph`
 
@@ -287,6 +288,71 @@ analyst/shared → writer/shared → reviewer/isolated
 ```
 
 完整字段见 [`docs/SCHEMA.md`](docs/SCHEMA.md)。
+
+## Graph 可视化
+
+`/pi-graph visualize <graph>` 把任意已发现图渲染成 Mermaid `flowchart LR` 并直接在 Pi TUI 中显示。结构直接来自图定义本身；即便存在编译错误也会先渲染，便于排查控制流问题。
+
+```text
+/pi-graph visualize research-review
+```
+
+输出包含一个摘要 header（节点 / edge / route 计数，或编译错误数）和一个 Mermaid 代码块。下面的图由同一渲染逻辑（`generateMermaid`）通过 `npm run render:graphs` 预渲染成 SVG 并提交进仓库，因此在 GitHub、npm 和任何不支持 Mermaid 的预览器里都能直接看到。
+
+### 节点形状
+
+| 类型 | 形状 | Mermaid 语法 |
+|---|---|---|
+| `agent` | stadium（圆角矩形） | `id([id])` |
+| `set` | subroutine（双边框矩形） | `id[[id]]` |
+| `human` | hexagon（六边形） | `id{id}` |
+| `__end__` | circle（圆形） | `__end__((end))` |
+
+入口节点（`entry` 中真实存在的节点 id）用绿色加粗边框标记：`classDef entry stroke:#2a2,stroke-width:3px;`。
+
+### 边与路由
+
+- 静态 edge：实线箭头 `a --> b`。`from`/`to` 为数组时展开成所有组合，因此 fan-out 和 barrier fan-in 在图上表现为多条平行箭头。
+- 条件 route：虚线箭头带条件标签 `a -. "label" .-> b`；未命中的 `default` 分支标注为 `else`。
+- 条件标签由 condition DSL 生成：`all`/`any`/`not` 渲染为 `∧`/`∨`/`¬`，比较符映射成 `==`、`!=`、`>`、`≥`、`<`、`≤` 等；标签中的 `"` 会被替换成 `'` 以保持 Mermaid 语法合法。
+
+### 示例：并行研究 + thread writer + 独立 reviewer
+
+`/pi-graph visualize research-review` 渲染为：
+
+![research-review graph](docs/images/research-review.svg)
+
+两个入口节点（并行 isolated 研究）在 writer 处 barrier 汇合；reviewer 的条件 route 在达标时走向 `__end__`，否则带 `else` 标签回到 writer 形成修订回环。
+
+### 示例：并行 fan-out + barrier 锦标赛
+
+`/pi-graph visualize idea-tournament` 展示三条并行 ideator 分支如何通过同一 edge 汇聚到 barrier 节点 judge：
+
+![idea-tournament graph](docs/images/idea-tournament.svg)
+
+### 其余示例图
+
+`coding-review`（thread coder + 独立 reviewer + human approval，两层条件回环）：
+
+![coding-review graph](docs/images/coding-review.svg)
+
+`shared-handoff`（显式 shared message channel + isolated reviewer 修订回环）：
+
+![shared-handoff graph](docs/images/shared-handoff.svg)
+
+`science-research`（planner fan-out 三条并行分支 → barrier evidence 评审 → 集成 → 报告）：
+
+![science-research graph](docs/images/science-research.svg)
+
+### 重新生成
+
+编辑 `examples/*.json` 后重跑脚本即可刷新所有 SVG（调用与 `/pi-graph visualize` 相同的 `generateMermaid`，保证与 TUI 输出一致）：
+
+```bash
+npm run render:graphs
+```
+
+`docs/images/*.svg` 已提交进仓库，读者无需运行脚本即可看到图；`@mermaid-js/mermaid-cli` 仅为 devDependency，不进入运行时。
 
 ## State 与 reducers
 

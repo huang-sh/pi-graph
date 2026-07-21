@@ -32,11 +32,12 @@
 		"test": "tsx --test test/*.test.ts",
 		"check": "tsc -p tsconfig.json --noEmit",
 		"validate:examples": "tsx scripts/validate-examples.ts",
+		"render:graphs": "tsx scripts/render-graphs.ts",
 		"prepublishOnly": "npm run check && npm test && npm run validate:examples"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-tui": "*",
 		"typebox": "*"
 	},
@@ -55,9 +56,10 @@
 		"@earendil-works/pi-ai": "0.80.10",
 		"@earendil-works/pi-coding-agent": "0.80.10",
 		"@earendil-works/pi-tui": "0.80.10",
+		"@mermaid-js/mermaid-cli": "^11.16.0",
 		"@types/node": "22.20.1",
+		"tsx": "4.22.1",
 		"typebox": "1.1.38",
-		"typescript": "5.8.3",
-		"tsx": "4.22.1"
+		"typescript": "5.8.3"
 	}
 }
