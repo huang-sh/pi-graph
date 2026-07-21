@@ -1,5 +1,7 @@
 # pi-graph
 
+[English](README.en.md) | **中文**
+
 `pi-graph` 是面向 [Pi agent harness](https://github.com/earendil-works/pi) 的状态图扩展。它借鉴 [LangGraph](https://github.com/langchain-ai/langgraph) 的低层编排理念，用显式 state、nodes、edges、reducers、supersteps、checkpoint 和 interrupt 组织 Pi agent 工作流。
 
 当前版本：**0.0.1**。
