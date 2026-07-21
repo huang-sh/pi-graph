@@ -1,0 +1,268 @@
+{
+  "schemaVersion": 1,
+  "name": "science-research",
+  "description": "Models ONE Science Agent research iteration (GENERATE->TEST->REVIEW->INTEGRATE->REPORT) from ds-design.md. A planner (thread) proposes 3 discriminating angles; isolated branch workers explore them in parallel, appending structured BranchResults; an evidence critic reviews quality/conflicts at a barrier; an integrator maps evidence to hypotheses and confidence bands; a reporter synthesizes the final report. The design multi-iteration convergence loop lives in the outer Harness (which re-invokes this graph per iteration with a fresh frontier), not in accumulating graph state.",
+  "entry": "planner",
+  "reducers": {
+    "branch_results": "append"
+  },
+  "initialState": {
+    "research": {
+      "confidence_threshold": 0.7,
+      "max_iterations": 3
+    }
+  },
+  "nodes": {
+    "planner": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "GENERATE: propose 3 distinct, discriminating investigation angles from the research question and prior integration (if any).",
+      "reads": [
+        "integration"
+      ],
+      "prompt": "You are the research Planner. Given the research question and the prior integration summary (if any from a previous iteration), propose exactly 3 DISTINCT investigation angles labeled A, B, C.\n\nEach angle must either target one specific hypothesis or discriminate between competing hypotheses. Prefer angles whose results would change the conclusion.\n\nResearch question:\n{{input.task}}\n\nPrior integration (if any):\n{{integration}}\n\nReturn a concise plan: for each of A/B/C, one sentence on what to investigate and which hypothesis it bears on.",
+      "readOnly": true,
+      "tools": [],
+      "output": "plan",
+      "thinking": "off",
+      "context": {
+        "mode": "thread",
+        "threadKey": "planner"
+      },
+      "retry": {
+        "maxAttempts": 1
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 120000,
+        "maxTurns": 6,
+        "maxTokens": 15000,
+        "maxCostUsd": 0.3
+      }
+    },
+    "branch_a": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "TEST angle A in an isolated session.",
+      "reads": [
+        "plan"
+      ],
+      "prompt": "You are an isolated research Branch Worker. Investigate ONLY angle A from the plan, using established scientific knowledge (no file exploration).\n\nResearch question:\n{{input.task}}\n\nPlan:\n{{plan}}\n\nReturn JSON with EXACTLY: {\"angle\": \"A\", \"observations\": [\"...\"], \"evidence\": [{\"claim\": \"...\", \"quality\": \"low|moderate|high\", \"directness\": \"direct|indirect\"}], \"hypothesis_impacts\": [{\"hypothesis\": \"...\", \"relation\": \"supports|contradicts|inconclusive\", \"strength\": \"weak|moderate|strong\", \"rationale\": \"...\"}], \"limitations\": [\"...\"]}.",
+      "readOnly": true,
+      "tools": [],
+      "output": "branch_results",
+      "response": {
+        "format": "json",
+        "maxBytes": 24576
+      },
+      "thinking": "off",
+      "context": {
+        "mode": "isolated"
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 800
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 120000,
+        "maxTurns": 6,
+        "maxTokens": 18000,
+        "maxCostUsd": 0.3
+      }
+    },
+    "branch_b": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "TEST angle B in an isolated session.",
+      "reads": [
+        "plan"
+      ],
+      "prompt": "You are an isolated research Branch Worker. Investigate ONLY angle B from the plan, using established scientific knowledge (no file exploration).\n\nResearch question:\n{{input.task}}\n\nPlan:\n{{plan}}\n\nReturn JSON with EXACTLY: {\"angle\": \"B\", \"observations\": [\"...\"], \"evidence\": [{\"claim\": \"...\", \"quality\": \"low|moderate|high\", \"directness\": \"direct|indirect\"}], \"hypothesis_impacts\": [{\"hypothesis\": \"...\", \"relation\": \"supports|contradicts|inconclusive\", \"strength\": \"weak|moderate|strong\", \"rationale\": \"...\"}], \"limitations\": [\"...\"]}.",
+      "readOnly": true,
+      "tools": [],
+      "output": "branch_results",
+      "response": {
+        "format": "json",
+        "maxBytes": 24576
+      },
+      "thinking": "off",
+      "context": {
+        "mode": "isolated"
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 800
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 120000,
+        "maxTurns": 6,
+        "maxTokens": 18000,
+        "maxCostUsd": 0.3
+      }
+    },
+    "branch_c": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "TEST angle C in an isolated session.",
+      "reads": [
+        "plan"
+      ],
+      "prompt": "You are an isolated research Branch Worker. Investigate ONLY angle C from the plan, using established scientific knowledge (no file exploration).\n\nResearch question:\n{{input.task}}\n\nPlan:\n{{plan}}\n\nReturn JSON with EXACTLY: {\"angle\": \"C\", \"observations\": [\"...\"], \"evidence\": [{\"claim\": \"...\", \"quality\": \"low|moderate|high\", \"directness\": \"direct|indirect\"}], \"hypothesis_impacts\": [{\"hypothesis\": \"...\", \"relation\": \"supports|contradicts|inconclusive\", \"strength\": \"weak|moderate|strong\", \"rationale\": \"...\"}], \"limitations\": [\"...\"]}.",
+      "readOnly": true,
+      "tools": [],
+      "output": "branch_results",
+      "response": {
+        "format": "json",
+        "maxBytes": 24576
+      },
+      "thinking": "off",
+      "context": {
+        "mode": "isolated"
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 800
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 120000,
+        "maxTurns": 6,
+        "maxTokens": 18000,
+        "maxCostUsd": 0.3
+      }
+    },
+    "evidence_critic": {
+      "type": "agent",
+      "purpose": "reviewer",
+      "description": "REVIEW: at the barrier, assess evidence quality, conflicts, and limitations across all branch results.",
+      "reads": [
+        "branch_results"
+      ],
+      "prompt": "You are the Evidence Critic. Three branch workers returned results:\n\n{{branch_results}}\n\nReview for: (1) evidence quality and directness, (2) conflicts between branches, (3) key limitations. Do NOT invent new evidence; only assess what's present.\n\nReturn JSON with EXACTLY: {\"strongest_evidence\": [\"...\"], \"conflicts\": [\"...\"], \"key_limitations\": [\"...\"], \"quality_assessment\": \"<one paragraph>\"}.",
+      "readOnly": true,
+      "tools": [],
+      "output": "reviewed_evidence",
+      "response": {
+        "format": "json",
+        "maxBytes": 24576
+      },
+      "thinking": "off",
+      "context": {
+        "mode": "isolated"
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 800
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 120000,
+        "maxTurns": 6,
+        "maxTokens": 26000,
+        "maxCostUsd": 0.3
+      }
+    },
+    "integrator": {
+      "type": "agent",
+      "purpose": "reviewer",
+      "description": "INTEGRATE: map reviewed evidence to hypotheses, assign confidence bands, decide whether evidence is sufficient to report.",
+      "reads": [
+        "reviewed_evidence",
+        "research.confidence_threshold"
+      ],
+      "prompt": "You are the Evidence Integrator. Map the reviewed evidence onto the competing hypotheses, assign each hypothesis a confidence band, and decide whether the evidence is sufficient to produce a final report.\n\nReviewed evidence:\n{{reviewed_evidence}}\n\nConfidence threshold for reporting: {{research.confidence_threshold}}.\n\nReturn JSON with EXACTLY: {\"hypotheses\": [{\"claim\": \"...\", \"confidence\": \"unsupported|weak|plausible|moderate|strong\", \"net_support\": \"supports|contradicts|inconclusive\"}], \"leading\": \"<the currently best-supported claim>\", \"sufficient\": <boolean: true if the leading hypothesis is 'moderate' or 'strong' AND no unresolved fatal conflict remains; otherwise false>, \"open_questions\": [\"...\"]}. Be conservative: weak or conflicting evidence means sufficient=false so the loop can refine.",
+      "readOnly": true,
+      "tools": [],
+      "output": "integration",
+      "response": {
+        "format": "json",
+        "maxBytes": 24576
+      },
+      "thinking": "off",
+      "context": {
+        "mode": "isolated"
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 800
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 120000,
+        "maxTurns": 6,
+        "maxTokens": 26000,
+        "maxCostUsd": 0.3
+      }
+    },
+    "reporter": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "REPORT: synthesize the final research report from the integrated hypotheses and reviewed evidence.",
+      "reads": [
+        "integration",
+        "reviewed_evidence"
+      ],
+      "prompt": "You are the Research Reporter. Produce the final report for this research question.\n\nResearch question:\n{{input.task}}\n\nIntegrated hypotheses:\n{{integration}}\n\nReviewed evidence:\n{{reviewed_evidence}}\n\nStructure: (1) Lead conclusion with confidence band, (2) Supporting evidence and its strength, (3) Limitations and conflicts, (4) What remains open. Use honest scientific hedging (weakly supported / plausible / moderately supported / strong); do NOT present internal scores as real probabilities.",
+      "readOnly": true,
+      "tools": [],
+      "output": "report",
+      "thinking": "off",
+      "context": {
+        "mode": "isolated"
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 800
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 120000,
+        "maxTurns": 6,
+        "maxTokens": 26000,
+        "maxCostUsd": 0.3
+      }
+    }
+  },
+  "edges": [
+    {
+      "from": "planner",
+      "to": [
+        "branch_a",
+        "branch_b",
+        "branch_c"
+      ]
+    },
+    {
+      "from": [
+        "branch_a",
+        "branch_b",
+        "branch_c"
+      ],
+      "to": "evidence_critic"
+    },
+    {
+      "from": "evidence_critic",
+      "to": "integrator"
+    },
+    {
+      "from": "integrator",
+      "to": "reporter"
+    }
+  ],
+  "routes": [],
+  "limits": {
+    "maxSteps": 16,
+    "maxNodeRuns": 24,
+    "maxConcurrency": 3,
+    "maxCostUsd": 4,
+    "maxTokens": 250000,
+    "timeoutMs": 900000,
+    "maxStateBytes": 2097152
+  },
+  "policy": {
+    "allowNonInteractive": true,
+    "allowNonInteractiveMutations": false
+  }
+}

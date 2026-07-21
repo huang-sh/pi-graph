@@ -487,3 +487,4 @@ npm run validate:examples
 - [`examples/coding-review.json`](examples/coding-review.json)：shared coder thread + independent reviewer + human approval
 - [`examples/shared-handoff.json`](examples/shared-handoff.json)：显式 shared message channel + isolated reviewer
 - [`examples/idea-tournament.json`](examples/idea-tournament.json)：parallel fan-out（3 ideators）+ `append` reducer 聚合 + barrier judge 锦标赛
+- [`examples/science-research.json`](examples/science-research.json)：多阶段科研闭环（planner→并行分支→证据评审→集成→报告），单趟 = 一次科研迭代；对应 Science Agent 设计的 GENERATE/TEST/REVIEW/INTEGRATE/REPORT
