@@ -486,3 +486,4 @@ npm run validate:examples
 - [`examples/research-review.json`](examples/research-review.json)：并行 isolated research + thread writer + isolated reviewer
 - [`examples/coding-review.json`](examples/coding-review.json)：shared coder thread + independent reviewer + human approval
 - [`examples/shared-handoff.json`](examples/shared-handoff.json)：显式 shared message channel + isolated reviewer
+- [`examples/idea-tournament.json`](examples/idea-tournament.json)：parallel fan-out（3 ideators）+ `append` reducer 聚合 + barrier judge 锦标赛
