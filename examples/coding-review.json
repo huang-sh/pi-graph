@@ -1,0 +1,170 @@
+{
+  "schemaVersion": 1,
+  "name": "coding-review",
+  "description": "Plan, implement, independently review, and require human approval before accepting a code change.",
+  "entry": "planner",
+  "nodes": {
+    "planner": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "Create a repository-grounded implementation plan before any mutation.",
+      "prompt": "Plan this code change:\n\n{{input.task}}\n\nInspect the repository and return a precise plan with affected files, invariants, tests, and rollback considerations.",
+      "readOnly": true,
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "output": "plan",
+      "retry": {
+        "maxAttempts": 1
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 300000,
+        "maxTurns": 12,
+        "maxTokens": 80000,
+        "maxCostUsd": 0.75
+      },
+      "context": {
+        "mode": "isolated"
+      }
+    },
+    "implementer": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "Apply the approved plan in the working tree and report exact changes and verification performed.",
+      "reads": [
+        "plan",
+        "review"
+      ],
+      "prompt": "Implement this task in the repository:\n\n{{input.task}}\n\nPlan:\n{{plan}}\n\nReviewer feedback from a prior pass, when present:\n{{review}}\n\nMake the smallest coherent change, run appropriate verification, and report modified files, commands, results, and remaining risks.",
+      "readOnly": false,
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls",
+        "bash",
+        "edit",
+        "write"
+      ],
+      "output": "implementation",
+      "retry": {
+        "maxAttempts": 1
+      },
+      "idempotent": false,
+      "limits": {
+        "timeoutMs": 600000,
+        "maxTurns": 24,
+        "maxTokens": 160000,
+        "maxCostUsd": 1.5
+      },
+      "context": {
+        "mode": "thread",
+        "threadKey": "coder"
+      }
+    },
+    "reviewer": {
+      "type": "agent",
+      "purpose": "reviewer",
+      "description": "Review the changed repository independently without modifying it.",
+      "reads": [
+        "plan",
+        "implementation"
+      ],
+      "prompt": "Independently review the repository after implementation of:\n\n{{input.task}}\n\nPlan:\n{{plan}}\n\nImplementer report:\n{{implementation}}\n\nInspect the actual files. Return JSON with exactly: {\"approved\": boolean, \"blockingIssues\": string[], \"nonBlockingIssues\": string[], \"evidence\": string[]}.",
+      "readOnly": true,
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "output": "review",
+      "response": {
+        "format": "json",
+        "maxBytes": 32768
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 750
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 300000,
+        "maxTurns": 12,
+        "maxTokens": 90000,
+        "maxCostUsd": 0.9
+      },
+      "context": {
+        "mode": "isolated"
+      }
+    },
+    "approval": {
+      "type": "human",
+      "purpose": "router",
+      "description": "Require an explicit human release decision after independent review.",
+      "kind": "confirm",
+      "prompt": "Independent review passed. Accept the implementation?\n\nReviewer report:\n{{review}}",
+      "output": "release.approved",
+      "pause": true
+    }
+  },
+  "edges": [
+    {
+      "from": "planner",
+      "to": "implementer"
+    },
+    {
+      "from": "implementer",
+      "to": "reviewer"
+    }
+  ],
+  "routes": [
+    {
+      "from": "reviewer",
+      "cases": [
+        {
+          "when": {
+            "path": "review.approved",
+            "op": "eq",
+            "value": true
+          },
+          "to": "approval"
+        }
+      ],
+      "default": "implementer"
+    },
+    {
+      "from": "approval",
+      "cases": [
+        {
+          "when": {
+            "path": "release.approved",
+            "op": "eq",
+            "value": true
+          },
+          "to": "__end__"
+        }
+      ],
+      "default": "implementer"
+    }
+  ],
+  "limits": {
+    "maxSteps": 10,
+    "maxNodeRuns": 14,
+    "maxConcurrency": 1,
+    "maxCostUsd": 5,
+    "maxTokens": 500000,
+    "timeoutMs": 1800000,
+    "maxStateBytes": 1048576
+  },
+  "policy": {
+    "allowNonInteractive": false,
+    "allowNonInteractiveMutations": false,
+    "confirmProjectGraph": true,
+    "confirmMutatingNodes": true
+  }
+}

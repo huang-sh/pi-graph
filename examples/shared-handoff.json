@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 1,
+  "name": "shared-handoff",
+  "description": "A role-tagged shared-message channel across independent Pi agent invocations.",
+  "entry": "analyst",
+  "nodes": {
+    "analyst": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "Analyze the task and establish facts for the writer.",
+      "prompt": "Analyze this task and identify the decisive facts, constraints, and unanswered questions:\n\n{{input.task}}",
+      "readOnly": true,
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "output": "analysis",
+      "context": {
+        "mode": "shared",
+        "messagesPath": "conversation.messages",
+        "maxMessages": 20,
+        "maxPromptBytes": 65536
+      },
+      "limits": {
+        "timeoutMs": 300000,
+        "maxTurns": 10,
+        "maxTokens": 60000,
+        "maxCostUsd": 0.6
+      }
+    },
+    "writer": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "Continue from the explicit shared conversation and produce the answer.",
+      "prompt": "Using the prior shared conversation and the authoritative analysis state, produce a concise, actionable answer for:\n\n{{input.task}}\n\nAnalysis state:\n{{analysis}}",
+      "reads": [
+        "analysis"
+      ],
+      "readOnly": true,
+      "tools": [],
+      "output": "answer",
+      "context": {
+        "mode": "shared",
+        "messagesPath": "conversation.messages",
+        "maxMessages": 20,
+        "maxPromptBytes": 65536
+      },
+      "limits": {
+        "timeoutMs": 240000,
+        "maxTurns": 8,
+        "maxTokens": 50000,
+        "maxCostUsd": 0.5
+      }
+    },
+    "reviewer": {
+      "type": "agent",
+      "purpose": "reviewer",
+      "description": "Review without inheriting the writer's private or shared conversational framing.",
+      "prompt": "Independently review this answer for correctness, completeness, and unsupported claims.\n\nTask:\n{{input.task}}\n\nAnswer:\n{{answer}}\n\nReturn JSON with exactly: {\"approved\": boolean, \"issues\": string[]}.",
+      "reads": [
+        "answer"
+      ],
+      "readOnly": true,
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "output": "review",
+      "response": {
+        "format": "json",
+        "maxBytes": 32768
+      },
+      "context": {
+        "mode": "isolated"
+      },
+      "limits": {
+        "timeoutMs": 240000,
+        "maxTurns": 8,
+        "maxTokens": 50000,
+        "maxCostUsd": 0.5
+      }
+    }
+  },
+  "edges": [
+    {
+      "from": "analyst",
+      "to": "writer"
+    },
+    {
+      "from": "writer",
+      "to": "reviewer"
+    }
+  ],
+  "routes": [
+    {
+      "from": "reviewer",
+      "cases": [
+        {
+          "when": {
+            "path": "review.approved",
+            "op": "eq",
+            "value": true
+          },
+          "to": "__end__"
+        }
+      ],
+      "default": "writer"
+    }
+  ],
+  "limits": {
+    "maxSteps": 7,
+    "maxNodeRuns": 9,
+    "maxConcurrency": 1,
+    "maxCostUsd": 3,
+    "maxTokens": 300000,
+    "timeoutMs": 1200000,
+    "maxStateBytes": 1048576
+  },
+  "policy": {
+    "allowNonInteractive": true,
+    "allowNonInteractiveMutations": false,
+    "confirmProjectGraph": true,
+    "confirmMutatingNodes": true
+  }
+}

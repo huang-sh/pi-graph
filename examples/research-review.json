@@ -1,0 +1,203 @@
+{
+  "schemaVersion": 1,
+  "name": "research-review",
+  "description": "Parallel repository and requirements research, synthesis, independent review, and bounded revision.",
+  "entry": [
+    "repo_research",
+    "requirements_research"
+  ],
+  "initialState": {
+    "quality": {
+      "minimumScore": 0.8
+    }
+  },
+  "nodes": {
+    "repo_research": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "Inspect the repository and collect implementation-relevant evidence.",
+      "prompt": "Research the repository for this task:\n\n{{input.task}}\n\nReturn concise findings with file paths, constraints, risks, and open questions.",
+      "readOnly": true,
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "output": "research.repository",
+      "response": {
+        "format": "text",
+        "maxBytes": 65536
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 500
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 300000,
+        "maxTurns": 12,
+        "maxTokens": 80000,
+        "maxCostUsd": 0.75
+      },
+      "context": {
+        "mode": "isolated"
+      }
+    },
+    "requirements_research": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "Analyze the requested outcome, acceptance criteria, and edge cases independently from repository research.",
+      "prompt": "Analyze this task as a requirements specialist:\n\n{{input.task}}\n\nReturn acceptance criteria, ambiguous points, edge cases, and a minimal definition of done.",
+      "readOnly": true,
+      "tools": [],
+      "output": "research.requirements",
+      "response": {
+        "format": "text",
+        "maxBytes": 32768
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 500
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 240000,
+        "maxTurns": 8,
+        "maxTokens": 50000,
+        "maxCostUsd": 0.5
+      },
+      "context": {
+        "mode": "isolated"
+      }
+    },
+    "writer": {
+      "type": "agent",
+      "purpose": "worker",
+      "description": "Synthesize the two research streams into one actionable proposal and revise it from reviewer feedback.",
+      "reads": [
+        "research.repository",
+        "research.requirements",
+        "review"
+      ],
+      "prompt": "Produce the best actionable proposal for:\n\n{{input.task}}\n\nRepository evidence:\n{{research.repository}}\n\nRequirements analysis:\n{{research.requirements}}\n\nPrior independent review, when present:\n{{review}}\n\nThe proposal must identify the exact files or components to change, sequencing, verification, risks, and explicit non-goals.",
+      "readOnly": true,
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "output": "draft",
+      "response": {
+        "format": "text",
+        "maxBytes": 65536
+      },
+      "retry": {
+        "maxAttempts": 1
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 300000,
+        "maxTurns": 12,
+        "maxTokens": 90000,
+        "maxCostUsd": 0.8
+      },
+      "context": {
+        "mode": "thread",
+        "threadKey": "synthesizer"
+      }
+    },
+    "reviewer": {
+      "type": "agent",
+      "purpose": "reviewer",
+      "description": "Independently verify the proposal against repository evidence and acceptance criteria.",
+      "reads": [
+        "draft",
+        "research.repository",
+        "research.requirements",
+        "quality.minimumScore"
+      ],
+      "prompt": "Review this proposal skeptically. Check factual grounding, completeness, feasibility, risk handling, and verification quality.\n\nTask:\n{{input.task}}\n\nProposal:\n{{draft}}\n\nEvidence:\n{{research.repository}}\n\nRequirements:\n{{research.requirements}}\n\nMinimum passing score: {{quality.minimumScore}}\n\nReturn JSON with exactly: {\"approved\": boolean, \"score\": number from 0 to 1, \"issues\": string[], \"requiredChanges\": string[]}.",
+      "readOnly": true,
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "output": "review",
+      "response": {
+        "format": "json",
+        "maxBytes": 32768
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 750
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 300000,
+        "maxTurns": 10,
+        "maxTokens": 70000,
+        "maxCostUsd": 0.75
+      },
+      "context": {
+        "mode": "isolated"
+      }
+    }
+  },
+  "edges": [
+    {
+      "from": [
+        "repo_research",
+        "requirements_research"
+      ],
+      "to": "writer"
+    },
+    {
+      "from": "writer",
+      "to": "reviewer"
+    }
+  ],
+  "routes": [
+    {
+      "from": "reviewer",
+      "cases": [
+        {
+          "when": {
+            "all": [
+              {
+                "path": "review.approved",
+                "op": "eq",
+                "value": true
+              },
+              {
+                "path": "review.score",
+                "op": "gte",
+                "value": 0.8
+              }
+            ]
+          },
+          "to": "__end__"
+        }
+      ],
+      "default": "writer"
+    }
+  ],
+  "limits": {
+    "maxSteps": 8,
+    "maxNodeRuns": 12,
+    "maxConcurrency": 2,
+    "maxCostUsd": 3,
+    "maxTokens": 350000,
+    "timeoutMs": 1200000,
+    "maxStateBytes": 1048576
+  },
+  "policy": {
+    "allowNonInteractive": true,
+    "allowNonInteractiveMutations": false,
+    "confirmProjectGraph": true,
+    "confirmMutatingNodes": true
+  }
+}

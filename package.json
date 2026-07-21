@@ -1,0 +1,59 @@
+{
+	"name": "pi-graph",
+	"version": "0.0.1",
+	"description": "A LangGraph-inspired Pi agent graph extension with isolated, persistent-thread, and shared-message context modes",
+	"type": "module",
+	"license": "MIT",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"agent-graph",
+		"langgraph",
+		"graph-engineering",
+		"multi-agent"
+	],
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"files": [
+		"extensions",
+		"src",
+		"examples",
+		"docs",
+		"README.md",
+		"CHANGELOG.md",
+		"LICENSE",
+		"AGENTS.md",
+		"scripts",
+		"test",
+		"tsconfig.json"
+	],
+	"scripts": {
+		"test": "tsx --test test/*.test.ts",
+		"check": "tsc -p tsconfig.json --noEmit",
+		"validate:examples": "tsx scripts/validate-examples.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./extensions/pi-graph.ts"
+		]
+	},
+	"exports": {
+		"./runtime": "./src/index.ts"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "0.80.10",
+		"@earendil-works/pi-coding-agent": "0.80.10",
+		"@earendil-works/pi-tui": "0.80.10",
+		"@types/node": "22.20.1",
+		"typebox": "1.1.38",
+		"typescript": "5.8.3",
+		"tsx": "4.22.1"
+	}
+}
