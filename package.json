@@ -31,7 +31,8 @@
 	"scripts": {
 		"test": "tsx --test test/*.test.ts",
 		"check": "tsc -p tsconfig.json --noEmit",
-		"validate:examples": "tsx scripts/validate-examples.ts"
+		"validate:examples": "tsx scripts/validate-examples.ts",
+		"prepublishOnly": "npm run check && npm test && npm run validate:examples"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
