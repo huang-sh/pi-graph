@@ -342,7 +342,7 @@ analyst/shared → writer/shared → reviewer/isolated
 
 ![shared-handoff graph](docs/images/shared-handoff.svg)
 
-`science-research`（planner fan-out 三条并行分支 → barrier evidence 评审 → 集成 → 报告）：
+`science-research`（人工 scope 门控 + 条件精修回环、并行 fan-out + barrier、由冲突触发的 shared 对抗辩论、带嵌套条件路由的 thread 集成、确定性归档 set 节点、分支 error-continue）：
 
 ![science-research graph](docs/images/science-research.svg)
 
@@ -556,4 +556,4 @@ npm run validate:examples
 - [`examples/coding-review.json`](examples/coding-review.json)：shared coder thread + independent reviewer + human approval
 - [`examples/shared-handoff.json`](examples/shared-handoff.json)：显式 shared message channel + isolated reviewer
 - [`examples/idea-tournament.json`](examples/idea-tournament.json)：parallel fan-out（3 ideators）+ `append` reducer 聚合 + barrier judge 锦标赛
-- [`examples/science-research.json`](examples/science-research.json)：多阶段科研闭环（planner→并行分支→证据评审→集成→报告），单趟 = 一次科研迭代；对应 Science Agent 设计的 GENERATE/TEST/REVIEW/INTEGRATE/REPORT
+- [`examples/science-research.json`](examples/science-research.json)：复杂非线性科研图，用于压测图引擎——人工 scope 门控 + 精修回环、并行 fan-out + barrier、shared 对抗辩论（devil's advocate ↔ defender）、thread 集成 + 嵌套条件路由、`set` 归档节点、分支 `onError: continue`

@@ -342,7 +342,7 @@ The two entry nodes (parallel isolated research) barrier-join at the writer; the
 
 ![shared-handoff graph](docs/images/shared-handoff.svg)
 
-`science-research` (planner fans out three parallel branches → barrier evidence review → integration → report):
+`science-research` (human scope gate + conditional refinement loop, parallel fan-out + barrier, conflict-triggered shared adversarial debate, thread integrator with nested conditional routing, deterministic archiving set node, branch error-continue):
 
 ![science-research graph](docs/images/science-research.svg)
 
@@ -556,4 +556,4 @@ Test coverage:
 - [`examples/coding-review.json`](examples/coding-review.json): shared coder thread + independent reviewer + human approval
 - [`examples/shared-handoff.json`](examples/shared-handoff.json): explicit shared message channel + isolated reviewer
 - [`examples/idea-tournament.json`](examples/idea-tournament.json): parallel fan-out (3 ideators) + `append` reducer aggregation + barrier judge tournament
-- [`examples/science-research.json`](examples/science-research.json): multi-stage research loop (planner → parallel branches → evidence review → integration → report); one pass = one research iteration, mapping to the Science Agent GENERATE/TEST/REVIEW/INTEGRATE/REPORT design
+- [`examples/science-research.json`](examples/science-research.json): complex non-linear research graph for stressing the engine — human scope gate + refinement loop, parallel fan-out + barrier, shared adversarial debate (devil's advocate ↔ defender), thread integrator with nested conditional routing, a deterministic archiving `set` node, and `onError: continue` on branches
