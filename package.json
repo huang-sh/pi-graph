@@ -33,6 +33,7 @@
 		"CHANGELOG.md",
 		"LICENSE",
 		"AGENTS.md",
+		"skills",
 		"scripts",
 		"test",
 		"tsconfig.json"
@@ -56,6 +57,9 @@
 	"pi": {
 		"extensions": [
 			"./extensions/pi-graph.ts"
+		],
+		"skills": [
+			"./skills"
 		]
 	},
 	"exports": {
