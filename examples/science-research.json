@@ -26,7 +26,7 @@
       "response": { "format": "json", "maxBytes": 16384 },
       "thinking": "off",
       "context": { "mode": "thread", "threadKey": "planner" },
-      "retry": { "maxAttempts": 1 },
+      "retry": { "maxAttempts": 3, "backoffMs": 500 },
       "idempotent": true,
       "limits": { "timeoutMs": 120000, "maxTurns": 6, "maxTokens": 15000, "maxCostUsd": 0.3 }
     },
@@ -165,7 +165,7 @@
       "response": { "format": "json", "maxBytes": 24576 },
       "thinking": "off",
       "context": { "mode": "thread", "threadKey": "integrator" },
-      "retry": { "maxAttempts": 1 },
+      "retry": { "maxAttempts": 3, "backoffMs": 500 },
       "idempotent": true,
       "limits": { "timeoutMs": 120000, "maxTurns": 6, "maxTokens": 26000, "maxCostUsd": 0.3 }
     },
@@ -238,7 +238,7 @@
     "maxConcurrency": 3,
     "maxCostUsd": 5,
     "maxTokens": 400000,
-    "timeoutMs": 1200000,
+    "timeoutMs": 3000000,
     "maxStateBytes": 2097152
   },
   "policy": {
