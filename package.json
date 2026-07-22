@@ -1,6 +1,6 @@
 {
 	"name": "@shying/pi-graph",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"description": "A LangGraph-inspired Pi agent graph extension with isolated, persistent-thread, and shared-message context modes",
 	"type": "module",
 	"license": "MIT",

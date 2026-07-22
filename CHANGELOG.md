@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.2 — 2026-07-22
+
+- Added `/pi-graph visualize <graph>`: render any discovered graph as a Mermaid flowchart in the Pi TUI (node shapes, static edges, conditional routes, and entry-node highlighting).
+- Added the `pi-graph` skill (`skills/pi-graph/SKILL.md`): a workflow-oriented guide for deciding when to use a graph and for authoring, validating, running, resuming, and visualizing one; registered via `pi.skills`.
+- Added the `science-research` example graph: a multi-stage research loop (planner → parallel branches → evidence review → integration → report).
+- Added an English README (`README.en.md`) with a language switcher linking both READMEs.
+- Rendered all example graphs as embedded SVGs in the README (`docs/images/`) via `npm run render:graphs`; `@mermaid-js/mermaid-cli` is a devDependency only.
+- Added GitHub `repository`, `bugs`, and `homepage` metadata to `package.json`.
+
 ## 0.0.1 — 2026-07-21
 
 - Reversioned the package to `0.0.1` as the active baseline.
