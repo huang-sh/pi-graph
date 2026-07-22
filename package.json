@@ -4,6 +4,14 @@
 	"description": "A LangGraph-inspired Pi agent graph extension with isolated, persistent-thread, and shared-message context modes",
 	"type": "module",
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/huang-sh/pi-graph.git"
+	},
+	"bugs": {
+		"url": "https://github.com/huang-sh/pi-graph/issues"
+	},
+	"homepage": "https://github.com/huang-sh/pi-graph#readme",
 	"keywords": [
 		"pi-package",
 		"pi-extension",
