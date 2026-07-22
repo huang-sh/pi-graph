@@ -180,9 +180,10 @@
     "bump_round": {
       "type": "set",
       "purpose": "deterministic",
-      "description": "Deterministic waypoint on the refinement path: archives the current integration into the append-only history log before routing back to the planner.",
+      "description": "Deterministic waypoint on the refinement path: archives the current integration into the append-only history log, AND clears branch_results so the next round's evidence_critic reviews only the fresh round (prevents unbounded context growth across refinement rounds), before routing back to the planner.",
       "assign": [
-        { "path": "history", "from": "integration" }
+        { "path": "history", "from": "integration" },
+        { "path": "branch_results", "value": [] }
       ]
     },
     "reporter": {
