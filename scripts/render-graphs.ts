@@ -39,6 +39,7 @@ const GRAPHS = [
 	"coding-review",
 	"shared-handoff",
 	"science-research",
+	"science-research-auto",
 ];
 
 // Transparent background so diagrams read on both light and dark surfaces.

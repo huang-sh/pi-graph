@@ -5,6 +5,7 @@
 - Added `/pi-graph visualize <graph>`: render any discovered graph as a Mermaid flowchart in the Pi TUI (node shapes, static edges, conditional routes, and entry-node highlighting).
 - Added the `pi-graph` skill (`skills/pi-graph/SKILL.md`): a workflow-oriented guide for deciding when to use a graph and for authoring, validating, running, resuming, and visualizing one; registered via `pi.skills`.
 - Added the `science-research` example graph: a multi-stage research loop (planner → parallel branches → evidence review → integration → report).
+- Added the `science-research-auto` example graph: a fully-autonomous variant of `science-research` that replaces the human scope gate with an isolated agent reviewer (`scope_review`) so the whole graph runs headless with no human in the loop; all other mechanics (parallel fan-out + barrier, shared adversarial debate, thread integrator, refinement loop) are preserved.
 - Added an English README (`README.en.md`) with a language switcher linking both READMEs.
 - Rendered all example graphs as embedded SVGs in the README (`docs/images/`) via `npm run render:graphs`; `@mermaid-js/mermaid-cli` is a devDependency only.
 - Added GitHub `repository`, `bugs`, and `homepage` metadata to `package.json`.

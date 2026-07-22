@@ -346,6 +346,10 @@ analyst/shared → writer/shared → reviewer/isolated
 
 ![science-research graph](docs/images/science-research.svg)
 
+`science-research-auto`（`science-research` 的全自动变体：用 isolated agent 评审节点 `scope_review` 取代人工 scope 门控，由 agent 自行判断 approve/refine；其余机制不变——并行 fan-out + barrier、shared 对抗辩论、thread 集成 + 嵌套条件路由、精修回环。适合 headless / CI 等无人工介入场景）：
+
+![science-research-auto graph](docs/images/science-research-auto.svg)
+
 ### 重新生成
 
 编辑 `examples/*.json` 后重跑脚本即可刷新所有 SVG（调用与 `/pi-graph visualize` 相同的 `generateMermaid`，保证与 TUI 输出一致）：
@@ -557,3 +561,4 @@ npm run validate:examples
 - [`examples/shared-handoff.json`](examples/shared-handoff.json)：显式 shared message channel + isolated reviewer
 - [`examples/idea-tournament.json`](examples/idea-tournament.json)：parallel fan-out（3 ideators）+ `append` reducer 聚合 + barrier judge 锦标赛
 - [`examples/science-research.json`](examples/science-research.json)：复杂非线性科研图，用于压测图引擎——人工 scope 门控 + 精修回环、并行 fan-out + barrier、shared 对抗辩论（devil's advocate ↔ defender）、thread 集成 + 嵌套条件路由、`set` 归档节点、分支 `onError: continue`
+- [`examples/science-research-auto.json`](examples/science-research-auto.json)：`science-research` 的全自动变体——用 isolated agent 评审 `scope_review` 取代人工门控，agent 自行判断 approve/refine，适合 headless 运行；保留并行 fan-out + barrier、shared 对抗辩论、thread 集成 + 嵌套条件路由、精修回环

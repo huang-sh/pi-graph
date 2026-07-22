@@ -346,6 +346,10 @@ The two entry nodes (parallel isolated research) barrier-join at the writer; the
 
 ![science-research graph](docs/images/science-research.svg)
 
+`science-research-auto` (a fully-autonomous variant of `science-research`: the human scope gate is replaced by an isolated agent reviewer node `scope_review` that self-judges approve/refine; all other mechanics are preserved — parallel fan-out + barrier, shared adversarial debate, thread integrator with nested conditional routing, refinement loop. Suited to headless / CI runs with no human in the loop):
+
+![science-research-auto graph](docs/images/science-research-auto.svg)
+
 ### Regenerating
 
 After editing `examples/*.json`, re-run the script to refresh every SVG (it calls the same `generateMermaid` as `/pi-graph visualize`, so output stays consistent with the TUI):
@@ -557,3 +561,4 @@ Test coverage:
 - [`examples/shared-handoff.json`](examples/shared-handoff.json): explicit shared message channel + isolated reviewer
 - [`examples/idea-tournament.json`](examples/idea-tournament.json): parallel fan-out (3 ideators) + `append` reducer aggregation + barrier judge tournament
 - [`examples/science-research.json`](examples/science-research.json): complex non-linear research graph for stressing the engine — human scope gate + refinement loop, parallel fan-out + barrier, shared adversarial debate (devil's advocate ↔ defender), thread integrator with nested conditional routing, a deterministic archiving `set` node, and `onError: continue` on branches
+- [`examples/science-research-auto.json`](examples/science-research-auto.json): fully-autonomous variant of `science-research` — replaces the human scope gate with an isolated agent reviewer (`scope_review`) that self-judges approve/refine, suited to headless runs; preserves parallel fan-out + barrier, shared adversarial debate, thread integrator with nested conditional routing, and the refinement loop
