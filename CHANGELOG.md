@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.3 — 2026-07-23
 
 - Consolidated graph topology analysis so target validation, reachability, cycle detection, and fan-out checks share one representation; `onError.to` is now accepted only with `strategy: "route"`.
 - Replaced hand-written raw graph parsing with an exact TypeBox structure schema. Unknown control fields now fail closed while `initialState` and user data values remain open JSON.
@@ -12,8 +12,6 @@
 - Reduced the npm publish whitelist to runtime, examples, documentation, and skills; development tests, scripts, agent notes, and TypeScript configuration are no longer packed.
 - Added a bounded live runtime board for graph runs and resumes, showing the current superstep, queued/running/retrying/completed nodes, topology, elapsed time, usage, and cost in both the Pi TUI widget and streaming tool result. The event stream additively exposes structured `step_start.scheduled` nodes and immediate, observational `node_settled` events without changing ordered `node_end`/checkpoint semantics.
 - Hardened the shipped reviewer workflows: malformed structured reviews now retry and preserve best-effort output, while `research-review` can repair missing repository evidence and exits through an explicit approved or bounded best-effort result before hard graph limits.
-
-## 0.0.3 — 2026-07-22
 
 - Added round-scoped state lifecycle primitives: the `collect` reducer, explicit `overwrite` and `unset` writes, hot-state limits, and per-path state budgets.
 - Added prompt hygiene: compiler diagnostics for template/`reads` overlap, runtime projection deduplication, compact shared state-reference suppression, and byte/token preflight limits before Pi is spawned.
