@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+- Consolidated graph topology analysis so target validation, reachability, cycle detection, and fan-out checks share one representation; `onError.to` is now accepted only with `strategy: "route"`.
+- Replaced hand-written raw graph parsing with an exact TypeBox structure schema. Unknown control fields now fail closed while `initialState` and user data values remain open JSON.
+- **Breaking:** moved graph definitions to `schemaVersion: 2`. Version 1 is rejected; duplicate output/prompt/state limit fields and non-reviewer `purpose` values were removed. See `docs/SCHEMA.md` for the one-time manual migration.
+- **Breaking:** checkpoint snapshots now require `version: 2` inside the existing `formatVersion: 2` envelope. Flat and v1 snapshots are rejected, and only the journal is read as authoritative recovery state.
+- Reused Pi terminal width/size helpers, Node's abortable promise timer and `rm(..., { force: true })`; centralized tool policy constants and removed undocumented wrappers.
+- Made the discovery result carry one required compiled graph instead of duplicating its definition, identity, hash and diagnostics.
+- Replaced the runtime barrel's accidental exports with an explicit compile/engine/checkpoint/executor interface.
+- Reduced the npm publish whitelist to runtime, examples, documentation, and skills; development tests, scripts, agent notes, and TypeScript configuration are no longer packed.
+- Added a bounded live runtime board for graph runs and resumes, showing the current superstep, queued/running/retrying/completed nodes, topology, elapsed time, usage, and cost in both the Pi TUI widget and streaming tool result. The event stream additively exposes structured `step_start.scheduled` nodes and immediate, observational `node_settled` events without changing ordered `node_end`/checkpoint semantics.
+- Hardened the shipped reviewer workflows: malformed structured reviews now retry and preserve best-effort output, while `research-review` can repair missing repository evidence and exits through an explicit approved or bounded best-effort result before hard graph limits.
+
+## 0.0.3 — 2026-07-22
+
+- Added round-scoped state lifecycle primitives: the `collect` reducer, explicit `overwrite` and `unset` writes, hot-state limits, and per-path state budgets.
+- Added prompt hygiene: compiler diagnostics for template/`reads` overlap, runtime projection deduplication, compact shared state-reference suppression, and byte/token preflight limits before Pi is spawned.
+- Changed shared capture to a bounded policy model (`none`, `compact`, `assistant-only`, `full`) and added `maxStoredMessages` durable retention with post-commit pruning.
+- Added runtime-managed artifact output so full reports and transcripts stay out of checkpoint state; state keeps content-addressed metadata and a bounded preview.
+- Added result projection and summary-first/path-oriented inspection; Pi tools no longer return the complete graph state or checkpoint by default.
+- Reworked both science-research examples around `working`/`memory`/`result`, current-round branch collection, explicit round cleanup, compact debate state, prompt budgets, and artifact-backed final reports.
+- Added compiler diagnostics for cyclic accumulating reducers, duplicate shared/output copies, orphaned artifact references, and duplicate/overlapping prompt projections.
+- Added regression tests for cross-round collection, overwrite/unset cleanup, duplicate prompt suppression, shared retention, prompt preflight rejection, artifact persistence, state budgets, and projected results.
+- Added exclusive run leases with heartbeat renewal over an immutable per-run operation journal; unexpired leases reject a second executor, expired/crashed owners can be replaced, and stale checkpoint commits are fenced by CAS. External node effects still require idempotency or downstream fencing after TTL-based takeover.
+- Added atomic hard-link CAS with non-reusable append-only sequence claims, revisioned immutable checkpoint blobs, durable inode/directory synchronization, and a `formatVersion: 2` checkpoint envelope; new runs are durable at revision 1 and legacy flat `version: 1` checkpoints migrate from revision 0.
+- Added strict checkpoint validation for all control fields, nested execution results, usage, history, thread UUIDs, interrupts, finite counters, status invariants, and immutable/monotonic properties across revisions.
+- Changed Pi graph tools to throw failures through Pi's real tool-error channel instead of returning an ineffective `isError` field.
+- Added concurrency, stale-revision, lease-takeover, crash-recovery, create/delete race, schema-corruption, extension-error, cancellation, and real offline Pi CLI contract tests.
+
 ## 0.0.2 — 2026-07-22
 
 - Added `/pi-graph visualize <graph>`: render any discovered graph as a Mermaid flowchart in the Pi TUI (node shapes, static edges, conditional routes, and entry-node highlighting).

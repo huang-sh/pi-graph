@@ -1,7 +1,7 @@
 {
 	"name": "@shying/pi-graph",
-	"version": "0.0.2",
-	"description": "A LangGraph-inspired Pi agent graph extension with isolated, persistent-thread, and shared-message context modes",
+	"version": "0.0.3",
+	"description": "A LangGraph-inspired Pi agent graph extension with durable execution, bounded state, artifacts, and explicit agent context modes",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
@@ -32,11 +32,7 @@
 		"README.en.md",
 		"CHANGELOG.md",
 		"LICENSE",
-		"AGENTS.md",
-		"skills",
-		"scripts",
-		"test",
-		"tsconfig.json"
+		"skills"
 	],
 	"scripts": {
 		"test": "tsx --test test/*.test.ts",
@@ -46,10 +42,10 @@
 		"prepublishOnly": "npm run check && npm test && npm run validate:examples"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-ai": "*",
-		"@earendil-works/pi-coding-agent": "*",
-		"@earendil-works/pi-tui": "*",
-		"typebox": "*"
+		"@earendil-works/pi-ai": "^0.80.10",
+		"@earendil-works/pi-coding-agent": "^0.80.10",
+		"@earendil-works/pi-tui": "^0.80.10",
+		"typebox": "^1.1.38"
 	},
 	"publishConfig": {
 		"access": "public"

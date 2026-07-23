@@ -1,12 +1,11 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "name": "shared-handoff",
   "description": "A role-tagged shared-message channel across independent Pi agent invocations.",
   "entry": "analyst",
   "nodes": {
     "analyst": {
       "type": "agent",
-      "purpose": "worker",
       "description": "Analyze the task and establish facts for the writer.",
       "prompt": "Analyze this task and identify the decisive facts, constraints, and unanswered questions:\n\n{{input.task}}",
       "readOnly": true,
@@ -21,7 +20,8 @@
         "mode": "shared",
         "messagesPath": "conversation.messages",
         "maxMessages": 20,
-        "maxPromptBytes": 65536
+        "maxPromptBytes": 65536,
+        "maxStoredMessages": 12
       },
       "limits": {
         "timeoutMs": 300000,
@@ -32,12 +32,8 @@
     },
     "writer": {
       "type": "agent",
-      "purpose": "worker",
       "description": "Continue from the explicit shared conversation and produce the answer.",
-      "prompt": "Using the prior shared conversation and the authoritative analysis state, produce a concise, actionable answer for:\n\n{{input.task}}\n\nAnalysis state:\n{{analysis}}",
-      "reads": [
-        "analysis"
-      ],
+      "prompt": "Using the prior shared conversation, produce a concise, actionable answer for:\n\n{{input.task}}\n\nPrior independent review, when present:\n{{review}}",
       "readOnly": true,
       "tools": [],
       "output": "answer",
@@ -45,7 +41,8 @@
         "mode": "shared",
         "messagesPath": "conversation.messages",
         "maxMessages": 20,
-        "maxPromptBytes": 65536
+        "maxPromptBytes": 65536,
+        "maxStoredMessages": 12
       },
       "limits": {
         "timeoutMs": 240000,
@@ -59,9 +56,6 @@
       "purpose": "reviewer",
       "description": "Review without inheriting the writer's private or shared conversational framing.",
       "prompt": "Independently review this answer for correctness, completeness, and unsupported claims.\n\nTask:\n{{input.task}}\n\nAnswer:\n{{answer}}\n\nReturn JSON with exactly: {\"approved\": boolean, \"issues\": string[]}.",
-      "reads": [
-        "answer"
-      ],
       "readOnly": true,
       "tools": [
         "read",
@@ -73,6 +67,17 @@
       "response": {
         "format": "json",
         "maxBytes": 32768
+      },
+      "retry": {
+        "maxAttempts": 3,
+        "backoffMs": 500,
+        "backoffMultiplier": 2
+      },
+      "idempotent": true,
+      "onError": {
+        "strategy": "route",
+        "to": "__end__",
+        "output": "errors.reviewer"
       },
       "context": {
         "mode": "isolated"
@@ -119,6 +124,15 @@
     "maxTokens": 300000,
     "timeoutMs": 1200000,
     "maxStateBytes": 1048576
+  },
+  "result": {
+    "paths": [
+      "answer",
+      "review",
+      "errors.reviewer"
+    ],
+    "includeState": false,
+    "maxBytes": 65536
   },
   "policy": {
     "allowNonInteractive": true,

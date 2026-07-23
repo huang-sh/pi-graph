@@ -7,35 +7,49 @@ import type {
 	EdgeDefinition,
 	GraphDefinition,
 	HumanNodeDefinition,
-	JsonObject,
 	NodeDefinition,
 	ReducerName,
 	RouteDefinition,
 	SetNodeDefinition,
 } from "./types.ts";
 import { posix as pathPosix } from "node:path";
+import { validateGraphStructure } from "./graph-schema.ts";
+import { DEFAULT_AGENT_TOOL_NAMES, READ_ONLY_TOOL_NAMES, READ_ONLY_TOOL_SET } from "./tool-policy.ts";
 import { END } from "./types.ts";
 import {
 	asStringArray,
 	assertNonNegativeNumber,
 	assertPositiveInteger,
+	extractTemplatePaths,
 	hashJson,
 	isJsonObject,
 	normalizePath,
+	statePathsOverlap,
 	toJsonValue,
 	uniqueStrings,
 } from "./utils.ts";
 
-const KNOWN_REDUCERS = new Set(["replace", "append", "concat", "merge", "sum", "min", "max"]);
+const KNOWN_REDUCERS = new Set(["replace", "append", "collect", "concat", "merge", "sum", "min", "max"]);
 const KNOWN_OPERATORS = new Set(["eq", "ne", "gt", "gte", "lt", "lte", "exists", "includes", "matches", "truthy"]);
-const KNOWN_NODE_TYPES = new Set(["agent", "set", "human"]);
-const KNOWN_PURPOSES = new Set(["worker", "reviewer", "router", "deterministic"]);
 const KNOWN_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const KNOWN_ERROR_STRATEGIES = new Set(["fail", "continue", "route"]);
 const KNOWN_HUMAN_KINDS = new Set(["confirm", "input", "select"]);
-const KNOWN_RESPONSE_FORMATS = new Set(["text", "json"]);
 const KNOWN_CONTEXT_MODES = new Set(["isolated", "thread", "shared"]);
-const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
+const KNOWN_SHARED_CAPTURE_MODES = new Set(["none", "assistant-only", "compact", "full"]);
+const KNOWN_OUTPUT_STORAGE = new Set(["state", "artifact"]);
+const KNOWN_WRITE_MODES = new Set(["reduce", "overwrite", "unset"]);
+
+interface GraphTargetGroup {
+	sources: string[];
+	targets: string[];
+	path: string;
+}
+
+interface GraphTopology {
+	targetGroups: GraphTargetGroup[];
+	adjacency: Map<string, Set<string>>;
+	fanOutGroups: string[][];
+}
 
 export class GraphValidationError extends Error {
 	readonly diagnostics: Diagnostic[];
@@ -47,36 +61,12 @@ export class GraphValidationError extends Error {
 	}
 }
 
-export function parseGraphDefinition(raw: unknown, source = "graph"): GraphDefinition {
+export function compileGraph(raw: unknown, source = "graph"): CompiledGraph {
 	const normalized = toJsonValue(raw, source);
 	if (!isJsonObject(normalized)) throw new Error(`${source} must be a JSON object`);
-	const diagnostics: Diagnostic[] = [];
-
-	if (normalized.schemaVersion !== 1) pushError(diagnostics, "SCHEMA_VERSION", "schemaVersion must be 1", "schemaVersion");
-	if (typeof normalized.name !== "string" || !normalized.name.trim()) {
-		pushError(diagnostics, "GRAPH_NAME", "name must be a non-empty string", "name");
-	}
-	validateOptionalString(normalized, "description", diagnostics, "description");
-	validateStringOrStringArray(normalized.entry, diagnostics, "entry");
-	if (!isJsonObject(normalized.nodes)) pushError(diagnostics, "NODES", "nodes must be an object", "nodes");
-
-	if (isJsonObject(normalized.nodes)) {
-		for (const [nodeId, rawNode] of Object.entries(normalized.nodes)) validateRawNode(nodeId, rawNode, diagnostics);
-	}
-	if (normalized.edges !== undefined) validateRawEdges(normalized.edges, diagnostics);
-	if (normalized.routes !== undefined) validateRawRoutes(normalized.routes, diagnostics);
-	if (normalized.reducers !== undefined) validateRawReducers(normalized.reducers, diagnostics);
-	if (normalized.initialState !== undefined && !isJsonObject(normalized.initialState)) {
-		pushError(diagnostics, "INITIAL_STATE", "initialState must be an object", "initialState");
-	}
-	if (normalized.limits !== undefined) validateRawLimits(normalized.limits, diagnostics, "limits", true);
-	if (normalized.policy !== undefined) validateRawPolicy(normalized.policy, diagnostics, "policy");
-
-	if (diagnostics.some((item) => item.level === "error")) throw new GraphValidationError(diagnostics);
-	return normalized as unknown as GraphDefinition;
-}
-
-export function compileGraph(definition: GraphDefinition): CompiledGraph {
+	const structuralDiagnostics = validateGraphStructure(normalized);
+	if (structuralDiagnostics.some((item) => item.level === "error")) throw new GraphValidationError(structuralDiagnostics);
+	const definition = normalized as unknown as GraphDefinition;
 	const diagnostics = validateGraph(definition);
 	if (diagnostics.some((item) => item.level === "error")) throw new GraphValidationError(diagnostics);
 	const staticEdges: CompiledEdge[] = (definition.edges ?? []).map((edge, index) => ({
@@ -97,16 +87,13 @@ export function compileGraph(definition: GraphDefinition): CompiledGraph {
 	};
 }
 
-export function parseAndCompileGraph(raw: unknown, source = "graph"): CompiledGraph {
-	return compileGraph(parseGraphDefinition(raw, source));
-}
-
-export function validateGraph(definition: GraphDefinition): Diagnostic[] {
+function validateGraph(definition: GraphDefinition): Diagnostic[] {
 	const diagnostics: Diagnostic[] = [];
 	const nodeIds = Object.keys(definition.nodes);
 	const nodeSet = new Set(nodeIds);
+	const topology = buildGraphTopology(definition);
 
-	if (definition.schemaVersion !== 1) pushError(diagnostics, "SCHEMA_VERSION", "schemaVersion must be 1", "schemaVersion");
+	if (definition.schemaVersion !== 2) pushError(diagnostics, "SCHEMA_VERSION", "schemaVersion must be 2", "schemaVersion");
 	if (!definition.name.trim()) pushError(diagnostics, "GRAPH_NAME", "name must be non-empty", "name");
 	if (nodeIds.length === 0) pushError(diagnostics, "EMPTY_GRAPH", "Graph must define at least one node", "nodes");
 	if (nodeIds.length === 1) {
@@ -118,8 +105,10 @@ export function validateGraph(definition: GraphDefinition): Diagnostic[] {
 		);
 	}
 
-	for (const entry of asStringArray(definition.entry)) validateTarget(entry, nodeSet, diagnostics, "entry");
-	for (const [nodeId, node] of Object.entries(definition.nodes)) validateNode(nodeId, node, diagnostics, nodeSet);
+	for (const [nodeId, node] of Object.entries(definition.nodes)) validateNode(nodeId, node, diagnostics);
+	for (const group of topology.targetGroups) {
+		for (const target of group.targets) validateTarget(target, nodeSet, diagnostics, group.path);
+	}
 
 	const routeSources = new Set<string>();
 	for (const [index, edge] of (definition.edges ?? []).entries()) validateEdge(edge, index, nodeSet, diagnostics);
@@ -143,258 +132,28 @@ export function validateGraph(definition: GraphDefinition): Diagnostic[] {
 	}
 
 	validateLimits(definition, diagnostics);
+	validateStatePolicy(definition, diagnostics);
 	validateGraphPolicy(definition, diagnostics);
-	validateReachability(definition, diagnostics);
+	validateResultPolicy(definition, diagnostics);
+	validateReachability(definition, topology.adjacency, diagnostics);
 	validateAgentContexts(definition, diagnostics);
 	validateThreadContextCompatibility(definition, diagnostics);
-	validateParallelWrites(definition, diagnostics);
-	validateParallelThreadContexts(definition, diagnostics);
+	validateParallelWrites(definition, topology.fanOutGroups, diagnostics);
+	validateAccumulatingReducersInCycles(definition, topology.adjacency, diagnostics);
+	validateParallelThreadContexts(definition, topology.fanOutGroups, diagnostics);
 	return diagnostics;
 }
 
-function validateRawNode(nodeId: string, rawNode: unknown, diagnostics: Diagnostic[]): void {
+function validateNode(nodeId: string, node: NodeDefinition, diagnostics: Diagnostic[]): void {
 	const path = `nodes.${nodeId}`;
-	if (!nodeId.trim() || nodeId === END) pushError(diagnostics, "NODE_ID", `${JSON.stringify(nodeId)} is not a valid node id`, path);
-	if (!isJsonObject(rawNode)) {
-		pushError(diagnostics, "NODE", "Node definition must be an object", path);
-		return;
+	if (!nodeId.trim() || nodeId === END || ["__proto__", "prototype", "constructor"].includes(nodeId)) {
+		pushError(diagnostics, "NODE_ID", `${JSON.stringify(nodeId)} is not a valid node id`, path);
 	}
-	if (typeof rawNode.type !== "string" || !KNOWN_NODE_TYPES.has(rawNode.type)) {
-		pushError(diagnostics, "NODE_TYPE", "Node type must be agent, set, or human", `${path}.type`);
-		return;
-	}
-
-	validateOptionalString(rawNode, "description", diagnostics, `${path}.description`);
-	validateOptionalString(rawNode, "output", diagnostics, `${path}.output`);
-	if (typeof rawNode.output === "string") validateStatePath(rawNode.output, diagnostics, `${path}.output`);
-	if (rawNode.purpose !== undefined && (typeof rawNode.purpose !== "string" || !KNOWN_PURPOSES.has(rawNode.purpose))) {
-		pushError(diagnostics, "NODE_PURPOSE", "purpose must be worker, reviewer, router, or deterministic", `${path}.purpose`);
-	}
-	if (rawNode.reads !== undefined) {
-		if (!isStringArray(rawNode.reads)) pushError(diagnostics, "NODE_READS", "reads must be an array of strings", `${path}.reads`);
-		else rawNode.reads.forEach((readPath, index) => validateStatePath(readPath, diagnostics, `${path}.reads.${index}`));
-	}
-	validateOptionalBoolean(rawNode, "idempotent", diagnostics, `${path}.idempotent`);
-	if (rawNode.retry !== undefined) validateRawRetry(rawNode.retry, diagnostics, `${path}.retry`);
-	if (rawNode.onError !== undefined) validateRawErrorPolicy(rawNode.onError, diagnostics, `${path}.onError`);
-	if (rawNode.limits !== undefined) validateRawLimits(rawNode.limits, diagnostics, `${path}.limits`, false);
-
-	if (rawNode.type === "agent") {
-		if (typeof rawNode.prompt !== "string" || !rawNode.prompt.trim()) {
-			pushError(diagnostics, "AGENT_PROMPT", "Agent node requires a non-empty prompt", `${path}.prompt`);
-		}
-		for (const field of ["systemPrompt", "model", "cwd"] as const) validateOptionalString(rawNode, field, diagnostics, `${path}.${field}`);
-		if (rawNode.thinking !== undefined && (typeof rawNode.thinking !== "string" || !KNOWN_THINKING_LEVELS.has(rawNode.thinking))) {
-			pushError(diagnostics, "THINKING_LEVEL", "Invalid thinking level", `${path}.thinking`);
-		}
-		if (rawNode.tools !== undefined && !isStringArray(rawNode.tools)) {
-			pushError(diagnostics, "AGENT_TOOLS", "Agent tools must be an array of strings", `${path}.tools`);
-		}
-		for (const field of ["readOnly", "loadExtensions", "loadSkills", "loadPromptTemplates", "includeContextFiles"] as const) {
-			validateOptionalBoolean(rawNode, field, diagnostics, `${path}.${field}`);
-		}
-		if (rawNode.response !== undefined) validateRawResponse(rawNode.response, diagnostics, `${path}.response`);
-		if (rawNode.context !== undefined) validateRawAgentContext(rawNode.context, diagnostics, `${path}.context`);
-	}
-	if (rawNode.type === "set") {
-		if (!Array.isArray(rawNode.assign)) pushError(diagnostics, "SET_ASSIGN", "Set node requires an assign array", `${path}.assign`);
-		else {
-			for (const [index, assignment] of rawNode.assign.entries()) {
-				const assignmentPath = `${path}.assign.${index}`;
-				if (!isJsonObject(assignment) || typeof assignment.path !== "string") {
-					pushError(diagnostics, "SET_ASSIGNMENT", "Assignment requires a string path", assignmentPath);
-					continue;
-				}
-				validateStatePath(assignment.path, diagnostics, `${assignmentPath}.path`);
-				const sourceCount = Number(assignment.value !== undefined) + Number(assignment.template !== undefined) + Number(assignment.from !== undefined);
-				if (sourceCount !== 1) {
-					pushError(diagnostics, "SET_ASSIGNMENT_SOURCE", "Assignment must define exactly one of value, template, or from", assignmentPath);
-				}
-				if (assignment.template !== undefined && typeof assignment.template !== "string") {
-					pushError(diagnostics, "SET_TEMPLATE", "template must be a string", `${assignmentPath}.template`);
-				}
-				if (assignment.from !== undefined) {
-					if (typeof assignment.from !== "string") pushError(diagnostics, "SET_FROM", "from must be a string", `${assignmentPath}.from`);
-					else validateStatePath(assignment.from, diagnostics, `${assignmentPath}.from`);
-				}
-			}
-		}
-	}
-	if (rawNode.type === "human") {
-		if (typeof rawNode.prompt !== "string" || !rawNode.prompt.trim()) {
-			pushError(diagnostics, "HUMAN_PROMPT", "Human node requires a non-empty prompt", `${path}.prompt`);
-		}
-		if (rawNode.kind !== undefined && (typeof rawNode.kind !== "string" || !KNOWN_HUMAN_KINDS.has(rawNode.kind))) {
-			pushError(diagnostics, "HUMAN_KIND", "kind must be confirm, input, or select", `${path}.kind`);
-		}
-		if (rawNode.options !== undefined && !isStringArray(rawNode.options)) {
-			pushError(diagnostics, "HUMAN_OPTIONS", "Human options must be an array of strings", `${path}.options`);
-		}
-		validateOptionalBoolean(rawNode, "pause", diagnostics, `${path}.pause`);
-	}
-}
-
-function validateRawRetry(value: unknown, diagnostics: Diagnostic[], path: string): void {
-	if (!isJsonObject(value)) {
-		pushError(diagnostics, "RETRY", "retry must be an object", path);
-		return;
-	}
-	validateRawNumber(value.maxAttempts, diagnostics, `${path}.maxAttempts`, { integer: true, positive: true });
-	validateRawNumber(value.backoffMs, diagnostics, `${path}.backoffMs`, { nonNegative: true });
-	validateRawNumber(value.backoffMultiplier, diagnostics, `${path}.backoffMultiplier`, { minimum: 1 });
-}
-
-function validateRawErrorPolicy(value: unknown, diagnostics: Diagnostic[], path: string): void {
-	if (!isJsonObject(value)) {
-		pushError(diagnostics, "ERROR_POLICY", "onError must be an object", path);
-		return;
-	}
-	if (value.strategy !== undefined && (typeof value.strategy !== "string" || !KNOWN_ERROR_STRATEGIES.has(value.strategy))) {
-		pushError(diagnostics, "ERROR_STRATEGY", "strategy must be fail, continue, or route", `${path}.strategy`);
-	}
-	if (value.to !== undefined) validateStringOrStringArray(value.to, diagnostics, `${path}.to`);
-	validateOptionalString(value, "output", diagnostics, `${path}.output`);
-	if (typeof value.output === "string") validateStatePath(value.output, diagnostics, `${path}.output`);
-}
-
-function validateRawResponse(value: unknown, diagnostics: Diagnostic[], path: string): void {
-	if (!isJsonObject(value)) {
-		pushError(diagnostics, "RESPONSE", "response must be an object", path);
-		return;
-	}
-	if (value.format !== undefined && (typeof value.format !== "string" || !KNOWN_RESPONSE_FORMATS.has(value.format))) {
-		pushError(diagnostics, "RESPONSE_FORMAT", "format must be text or json", `${path}.format`);
-	}
-	validateRawNumber(value.maxBytes, diagnostics, `${path}.maxBytes`, { integer: true, positive: true });
-}
-
-function validateRawAgentContext(value: unknown, diagnostics: Diagnostic[], path: string): void {
-	if (!isJsonObject(value)) {
-		pushError(diagnostics, "AGENT_CONTEXT", "context must be an object", path);
-		return;
-	}
-	if (value.mode !== undefined && (typeof value.mode !== "string" || !KNOWN_CONTEXT_MODES.has(value.mode))) {
-		pushError(diagnostics, "AGENT_CONTEXT_MODE", "context.mode must be isolated, thread, or shared", `${path}.mode`);
-	}
-	validateOptionalString(value, "threadKey", diagnostics, `${path}.threadKey`);
-	validateOptionalString(value, "messagesPath", diagnostics, `${path}.messagesPath`);
-	if (typeof value.messagesPath === "string") validateStatePath(value.messagesPath, diagnostics, `${path}.messagesPath`);
-	validateRawNumber(value.maxMessages, diagnostics, `${path}.maxMessages`, { integer: true, positive: true });
-	validateRawNumber(value.maxPromptBytes, diagnostics, `${path}.maxPromptBytes`, { integer: true, positive: true });
-}
-
-function validateRawLimits(value: unknown, diagnostics: Diagnostic[], path: string, graph: boolean): void {
-	if (!isJsonObject(value)) {
-		pushError(diagnostics, "LIMITS", "limits must be an object", path);
-		return;
-	}
-	const integerFields = graph
-		? ["maxSteps", "maxNodeRuns", "maxConcurrency", "maxTokens", "timeoutMs", "maxStateBytes"]
-		: ["timeoutMs", "maxTurns", "maxTokens", "maxOutputBytes"];
-	for (const field of integerFields) validateRawNumber(value[field], diagnostics, `${path}.${field}`, { integer: true, positive: true });
-	validateRawNumber(value.maxCostUsd, diagnostics, `${path}.maxCostUsd`, { nonNegative: true });
-}
-
-function validateRawPolicy(value: unknown, diagnostics: Diagnostic[], path: string): void {
-	if (!isJsonObject(value)) {
-		pushError(diagnostics, "POLICY", "policy must be an object", path);
-		return;
-	}
-	for (const field of ["allowNonInteractive", "allowNonInteractiveMutations", "confirmProjectGraph", "confirmMutatingNodes"] as const) {
-		validateOptionalBoolean(value, field, diagnostics, `${path}.${field}`);
-	}
-}
-
-interface RawNumberOptions {
-	integer?: boolean;
-	positive?: boolean;
-	nonNegative?: boolean;
-	minimum?: number;
-}
-
-function validateRawNumber(value: JsonObject[string] | undefined, diagnostics: Diagnostic[], path: string, options: RawNumberOptions): void {
-	if (value === undefined) return;
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		pushError(diagnostics, "NUMBER", "Expected a finite number", path);
-		return;
-	}
-	if (options.integer && !Number.isInteger(value)) pushError(diagnostics, "INTEGER", "Expected an integer", path);
-	if (options.positive && value <= 0) pushError(diagnostics, "POSITIVE", "Expected a positive number", path);
-	if (options.nonNegative && value < 0) pushError(diagnostics, "NON_NEGATIVE", "Expected a non-negative number", path);
-	if (options.minimum !== undefined && value < options.minimum) pushError(diagnostics, "MINIMUM", `Expected a value >= ${options.minimum}`, path);
-}
-
-function validateOptionalString(record: JsonObject, field: string, diagnostics: Diagnostic[], path: string): void {
-	if (record[field] !== undefined && typeof record[field] !== "string") pushError(diagnostics, "STRING", "Expected a string", path);
-}
-
-function validateOptionalBoolean(record: JsonObject, field: string, diagnostics: Diagnostic[], path: string): void {
-	if (record[field] !== undefined && typeof record[field] !== "boolean") pushError(diagnostics, "BOOLEAN", "Expected a boolean", path);
-}
-
-function validateRawEdges(rawEdges: unknown, diagnostics: Diagnostic[]): void {
-	if (!Array.isArray(rawEdges)) {
-		pushError(diagnostics, "EDGES", "edges must be an array", "edges");
-		return;
-	}
-	for (const [index, edge] of rawEdges.entries()) {
-		if (!isJsonObject(edge)) {
-			pushError(diagnostics, "EDGE", "Edge must be an object", `edges.${index}`);
-			continue;
-		}
-		validateStringOrStringArray(edge.from, diagnostics, `edges.${index}.from`);
-		validateStringOrStringArray(edge.to, diagnostics, `edges.${index}.to`);
-	}
-}
-
-function validateRawRoutes(rawRoutes: unknown, diagnostics: Diagnostic[]): void {
-	if (!Array.isArray(rawRoutes)) {
-		pushError(diagnostics, "ROUTES", "routes must be an array", "routes");
-		return;
-	}
-	for (const [index, route] of rawRoutes.entries()) {
-		if (!isJsonObject(route)) {
-			pushError(diagnostics, "ROUTE", "Route must be an object", `routes.${index}`);
-			continue;
-		}
-		if (typeof route.from !== "string") pushError(diagnostics, "ROUTE_FROM", "Route from must be a string", `routes.${index}.from`);
-		if (!Array.isArray(route.cases)) pushError(diagnostics, "ROUTE_CASES", "Route cases must be an array", `routes.${index}.cases`);
-		else {
-			for (const [caseIndex, item] of route.cases.entries()) {
-				if (!isJsonObject(item)) {
-					pushError(diagnostics, "ROUTE_CASE", "Route case must be an object", `routes.${index}.cases.${caseIndex}`);
-					continue;
-				}
-				if (!isJsonObject(item.when)) {
-					pushError(diagnostics, "CONDITION", "Route condition must be an object", `routes.${index}.cases.${caseIndex}.when`);
-				}
-				validateStringOrStringArray(item.to, diagnostics, `routes.${index}.cases.${caseIndex}.to`);
-			}
-		}
-		if (route.default !== undefined) validateStringOrStringArray(route.default, diagnostics, `routes.${index}.default`);
-	}
-}
-
-function validateRawReducers(rawReducers: unknown, diagnostics: Diagnostic[]): void {
-	if (!isJsonObject(rawReducers)) {
-		pushError(diagnostics, "REDUCERS", "reducers must be an object", "reducers");
-		return;
-	}
-	for (const [path, reducer] of Object.entries(rawReducers)) {
-		if (typeof reducer !== "string" || !KNOWN_REDUCERS.has(reducer)) {
-			pushError(diagnostics, "REDUCER", `Unknown reducer ${JSON.stringify(reducer)} at ${path}`, `reducers.${path}`);
-		}
-	}
-}
-
-function validateNode(nodeId: string, node: NodeDefinition, diagnostics: Diagnostic[], nodeSet: Set<string>): void {
-	const path = `nodes.${nodeId}`;
-	if (!nodeId.trim() || nodeId === END) pushError(diagnostics, "NODE_ID", `${JSON.stringify(nodeId)} is not a valid node id`, path);
 	if (node.output !== undefined) validateStatePath(node.output, diagnostics, `${path}.output`);
 	for (const [index, readPath] of (node.reads ?? []).entries()) validateStatePath(readPath, diagnostics, `${path}.reads.${index}`);
 	validateRetry(node, diagnostics, path);
 	validateNodeLimits(node, diagnostics, path);
-	validateErrorPolicy(node, diagnostics, path, nodeSet);
+	validateErrorPolicy(node, diagnostics, path);
 
 	if (node.type === "agent") validateAgentNode(nodeId, node, diagnostics, path);
 	else if (node.type === "set") validateSetNode(node, diagnostics, path);
@@ -419,11 +178,11 @@ function validateAgentNode(nodeId: string, node: AgentNodeDefinition, diagnostic
 			`${path}.context.mode`,
 		);
 	}
-	if (node.readOnly === true && node.tools?.some((tool) => !READ_ONLY_TOOLS.has(tool))) {
+	if (node.readOnly === true && node.tools?.some((tool) => !READ_ONLY_TOOL_SET.has(tool))) {
 		pushError(
 			diagnostics,
 			"READ_ONLY_TOOLS",
-			`Node ${nodeId} is read-only but requests a mutating or unknown tool. Allowed tools: ${[...READ_ONLY_TOOLS].join(", ")}.`,
+			`Node ${nodeId} is read-only but requests a mutating or unknown tool. Allowed tools: ${READ_ONLY_TOOL_NAMES.join(", ")}.`,
 			`${path}.tools`,
 		);
 	}
@@ -434,7 +193,67 @@ function validateAgentNode(nodeId: string, node: AgentNodeDefinition, diagnostic
 		pushError(diagnostics, "RESPONSE_FORMAT", "Agent response format must be text or json", `${path}.response.format`);
 	}
 	assertDiagnostic(() => assertPositiveInteger(node.response?.maxBytes, `${path}.response.maxBytes`), diagnostics, "RESPONSE_LIMIT", path);
+	assertDiagnostic(() => assertPositiveInteger(node.response?.previewBytes, `${path}.response.previewBytes`), diagnostics, "RESPONSE_LIMIT", path);
+	if (node.response?.storage !== undefined && !KNOWN_OUTPUT_STORAGE.has(node.response.storage)) {
+		pushError(diagnostics, "RESPONSE_STORAGE", `Unknown response storage ${node.response.storage}`, `${path}.response.storage`);
+	}
+	if (node.response?.mediaType !== undefined && !node.response.mediaType.trim()) {
+		pushError(diagnostics, "RESPONSE_MEDIA_TYPE", "response.mediaType must be non-empty", `${path}.response.mediaType`);
+	}
+	if (node.response?.storeOutput === false && node.output !== undefined) {
+		pushWarning(
+			diagnostics,
+			"OUTPUT_PATH_IGNORED",
+			`Node ${nodeId} sets response.storeOutput: false, so output path ${node.output} is not written.`,
+			`${path}.output`,
+		);
+	}
+	if ((node.response?.storage ?? "state") === "artifact" && node.response?.storeOutput === false) {
+		pushError(
+			diagnostics,
+			"ARTIFACT_REFERENCE_NOT_STORED",
+			`Node ${nodeId} requests artifact storage but disables its output write, so the artifact reference would be orphaned.`,
+			`${path}.response.storeOutput`,
+		);
+	}
+	validatePromptInputs(nodeId, node, diagnostics, path);
 	validateAgentContextPolicy(nodeId, node, diagnostics, path);
+}
+
+function validatePromptInputs(nodeId: string, node: AgentNodeDefinition, diagnostics: Diagnostic[], path: string): void {
+	const templatePaths = uniqueStrings([
+		...safeTemplatePaths(node.prompt, diagnostics, `${path}.prompt`),
+		...safeTemplatePaths(node.systemPrompt ?? "", diagnostics, `${path}.systemPrompt`),
+	]);
+	for (const [index, readPath] of (node.reads ?? []).entries()) {
+		if (templatePaths.includes(readPath)) {
+			pushWarning(
+				diagnostics,
+				"DUPLICATE_STATE_INJECTION",
+				`Node ${nodeId} reads ${readPath} and also interpolates the same path; runtime omits the duplicate reads payload.`,
+				`${path}.reads.${index}`,
+			);
+			continue;
+		}
+		const overlap = templatePaths.find((templatePath) => pathsOverlapForValidation(templatePath, readPath));
+		if (overlap) {
+			pushWarning(
+				diagnostics,
+				"OVERLAPPING_STATE_INJECTION",
+				`Node ${nodeId} reads ${readPath} and interpolates overlapping path ${overlap}. Runtime does not auto-remove parent/child overlaps because that could discard sibling fields; select one input path explicitly.`,
+				`${path}.reads.${index}`,
+			);
+		}
+	}
+}
+
+function safeTemplatePaths(template: string, diagnostics: Diagnostic[], path: string): string[] {
+	try {
+		return extractTemplatePaths(template);
+	} catch (error) {
+		pushError(diagnostics, "TEMPLATE_PATH", String(error), path);
+		return [];
+	}
 }
 
 function validateAgentContextPolicy(
@@ -467,7 +286,7 @@ function validateAgentContextPolicy(
 		}
 	}
 	if (mode !== "shared") {
-		for (const field of ["messagesPath", "maxMessages", "maxPromptBytes"] as const) {
+		for (const field of ["messagesPath", "maxMessages", "maxPromptBytes", "maxMessageBytes", "maxStoredMessages", "capture"] as const) {
 			if (context?.[field] !== undefined) {
 				pushError(diagnostics, "SHARED_CONTEXT_FIELD", `context.${field} is only valid for shared mode`, `${path}.context.${field}`);
 			}
@@ -483,8 +302,76 @@ function validateAgentContextPolicy(
 			"AGENT_CONTEXT_LIMIT",
 			path,
 		);
+		assertDiagnostic(
+			() => assertPositiveInteger(context?.maxMessageBytes, `${path}.context.maxMessageBytes`),
+			diagnostics,
+			"AGENT_CONTEXT_LIMIT",
+			path,
+		);
+		assertDiagnostic(
+			() => assertPositiveInteger(context?.maxStoredMessages, `${path}.context.maxStoredMessages`),
+			diagnostics,
+			"AGENT_CONTEXT_LIMIT",
+			path,
+		);
+		const capture = context?.capture ?? "compact";
+		if (!KNOWN_SHARED_CAPTURE_MODES.has(capture)) {
+			pushError(diagnostics, "SHARED_CAPTURE", `Unknown shared capture mode ${capture}`, `${path}.context.capture`);
+		}
+		if (capture === "compact" && node.response?.storeOutput === false) {
+			pushError(
+				diagnostics,
+				"SHARED_COMPACT_OUTPUT_REQUIRED",
+				`Node ${nodeId} uses compact shared capture, which stores a reference to the node output. response.storeOutput must not be false.`,
+				`${path}.response.storeOutput`,
+			);
+		}
+		if (capture === "full") {
+			pushWarning(
+				diagnostics,
+				"SHARED_FULL_CAPTURE",
+				`Node ${nodeId} stores rendered prompts and process messages in graph state. Use compact capture unless full transcripts are explicitly required.`,
+				`${path}.context.capture`,
+			);
+		}
+		if ((capture === "assistant-only" || capture === "full") && node.response?.storeOutput !== false) {
+			pushWarning(
+				diagnostics,
+				"SHARED_OUTPUT_DUPLICATED",
+				`Node ${nodeId} stores its final output both at ${node.output ?? `outputs.${nodeId}`} and inline in ${messagesPath}. Use compact capture or set response.storeOutput: false to keep one canonical copy.`,
+				`${path}.context.capture`,
+			);
+		}
+		if ((node.response?.storage ?? "state") === "artifact" && (capture === "assistant-only" || capture === "full")) {
+			pushWarning(
+				diagnostics,
+				"ARTIFACT_SHARED_INLINE_CAPTURE",
+				`Node ${nodeId} stores its output as an artifact but shared capture ${capture} also keeps output text inline in graph state. Use compact capture to retain only the artifact reference.`,
+				`${path}.context.capture`,
+			);
+		}
+		if (node.reads?.some((readPath) => pathsOverlapForValidation(readPath, messagesPath))) {
+			pushError(
+				diagnostics,
+				"SHARED_MESSAGES_DUPLICATE_READ",
+				`Node ${nodeId} receives ${messagesPath} automatically through shared context and must not also include it in reads.`,
+				`${path}.reads`,
+			);
+		}
+		const templatePaths = uniqueStrings([
+			...safeTemplatePaths(node.prompt, diagnostics, `${path}.prompt`),
+			...safeTemplatePaths(node.systemPrompt ?? "", diagnostics, `${path}.systemPrompt`),
+		]);
+		if (templatePaths.some((templatePath) => pathsOverlapForValidation(templatePath, messagesPath))) {
+			pushError(
+				diagnostics,
+				"SHARED_MESSAGES_DUPLICATE_TEMPLATE",
+				`Node ${nodeId} receives ${messagesPath} automatically through shared context and must not also interpolate it in prompt or systemPrompt.`,
+				path,
+			);
+		}
 		const outputPath = node.output ?? `outputs.${nodeId}`;
-		if (pathsOverlapForValidation(messagesPath, outputPath)) {
+		if (node.response?.storeOutput !== false && pathsOverlapForValidation(messagesPath, outputPath)) {
 			pushError(
 				diagnostics,
 				"SHARED_OUTPUT_OVERLAP",
@@ -514,17 +401,24 @@ function validateSetNode(node: SetNodeDefinition, diagnostics: Diagnostic[], pat
 		return;
 	}
 	for (const [index, assignment] of node.assign.entries()) {
-		validateStatePath(assignment.path, diagnostics, `${path}.assign.${index}.path`);
+		const assignmentPath = `${path}.assign.${index}`;
+		validateStatePath(assignment.path, diagnostics, `${assignmentPath}.path`);
+		const mode = assignment.mode ?? "reduce";
+		if (!KNOWN_WRITE_MODES.has(mode)) {
+			pushError(diagnostics, "SET_WRITE_MODE", `Unknown assignment mode ${mode}`, `${assignmentPath}.mode`);
+		}
 		const sourceCount = Number(assignment.value !== undefined) + Number(assignment.template !== undefined) + Number(assignment.from !== undefined);
-		if (sourceCount !== 1) {
+		if (mode === "unset" ? sourceCount !== 0 : sourceCount !== 1) {
 			pushError(
 				diagnostics,
 				"SET_ASSIGNMENT_SOURCE",
-				"Assignment must define exactly one of value, template, or from",
-				`${path}.assign.${index}`,
+				mode === "unset"
+					? "Unset assignment must not define value, template, or from"
+					: "Assignment must define exactly one of value, template, or from",
+				assignmentPath,
 			);
 		}
-		if (assignment.from !== undefined) validateStatePath(assignment.from, diagnostics, `${path}.assign.${index}.from`);
+		if (assignment.from !== undefined) validateStatePath(assignment.from, diagnostics, `${assignmentPath}.from`);
 	}
 }
 
@@ -563,10 +457,10 @@ function validateNodeLimits(node: NodeDefinition, diagnostics: Diagnostic[], pat
 	assertDiagnostic(() => assertPositiveInteger(limits.maxTurns, `${path}.limits.maxTurns`), diagnostics, "NODE_LIMIT", path);
 	assertDiagnostic(() => assertPositiveInteger(limits.maxTokens, `${path}.limits.maxTokens`), diagnostics, "NODE_LIMIT", path);
 	assertDiagnostic(() => assertNonNegativeNumber(limits.maxCostUsd, `${path}.limits.maxCostUsd`), diagnostics, "NODE_LIMIT", path);
-	assertDiagnostic(() => assertPositiveInteger(limits.maxOutputBytes, `${path}.limits.maxOutputBytes`), diagnostics, "NODE_LIMIT", path);
+	assertDiagnostic(() => assertPositiveInteger(limits.maxPromptBytes, `${path}.limits.maxPromptBytes`), diagnostics, "NODE_LIMIT", path);
 }
 
-function validateErrorPolicy(node: NodeDefinition, diagnostics: Diagnostic[], path: string, nodeSet: Set<string>): void {
+function validateErrorPolicy(node: NodeDefinition, diagnostics: Diagnostic[], path: string): void {
 	const policy = node.onError;
 	if (!policy) return;
 	const strategy = policy.strategy ?? "fail";
@@ -574,8 +468,8 @@ function validateErrorPolicy(node: NodeDefinition, diagnostics: Diagnostic[], pa
 	if (strategy === "route" && policy.to === undefined) {
 		pushError(diagnostics, "ERROR_ROUTE", "onError route strategy requires to", `${path}.onError.to`);
 	}
-	for (const target of policy.to === undefined ? [] : asStringArray(policy.to)) {
-		validateTarget(target, nodeSet, diagnostics, `${path}.onError.to`);
+	if (strategy !== "route" && policy.to !== undefined) {
+		pushError(diagnostics, "ERROR_ROUTE", "onError.to is only valid with strategy route", `${path}.onError.to`);
 	}
 	if (policy.output !== undefined) validateStatePath(policy.output, diagnostics, `${path}.onError.output`);
 }
@@ -588,7 +482,6 @@ function validateEdge(edge: EdgeDefinition, index: number, nodeSet: Set<string>,
 	for (const source of from) {
 		if (!nodeSet.has(source)) pushError(diagnostics, "EDGE_SOURCE", `Unknown edge source ${source}`, `edges.${index}.from`);
 	}
-	for (const target of to) validateTarget(target, nodeSet, diagnostics, `edges.${index}.to`);
 }
 
 function validateRoute(route: RouteDefinition, index: number, nodeSet: Set<string>, diagnostics: Diagnostic[]): void {
@@ -598,10 +491,6 @@ function validateRoute(route: RouteDefinition, index: number, nodeSet: Set<strin
 	}
 	for (const [caseIndex, item] of route.cases.entries()) {
 		validateCondition(item.when, diagnostics, `routes.${index}.cases.${caseIndex}.when`);
-		for (const target of asStringArray(item.to)) validateTarget(target, nodeSet, diagnostics, `routes.${index}.cases.${caseIndex}.to`);
-	}
-	for (const target of route.default === undefined ? [] : asStringArray(route.default)) {
-		validateTarget(target, nodeSet, diagnostics, `routes.${index}.default`);
 	}
 }
 
@@ -645,6 +534,21 @@ function validateLimits(definition: GraphDefinition, diagnostics: Diagnostic[]):
 	assertDiagnostic(() => assertPositiveInteger(limits.maxTokens, "limits.maxTokens"), diagnostics, "GRAPH_LIMIT", "limits.maxTokens");
 	assertDiagnostic(() => assertPositiveInteger(limits.timeoutMs, "limits.timeoutMs"), diagnostics, "GRAPH_LIMIT", "limits.timeoutMs");
 	assertDiagnostic(() => assertPositiveInteger(limits.maxStateBytes, "limits.maxStateBytes"), diagnostics, "GRAPH_LIMIT", "limits.maxStateBytes");
+	assertDiagnostic(() => assertPositiveInteger(limits.maxPromptBytes, "limits.maxPromptBytes"), diagnostics, "GRAPH_LIMIT", "limits.maxPromptBytes");
+}
+
+function validateStatePolicy(definition: GraphDefinition, diagnostics: Diagnostic[]): void {
+	const policy = definition.statePolicy;
+	if (!policy) return;
+	for (const [path, pathPolicy] of Object.entries(policy.paths ?? {})) {
+		validateStatePath(path, diagnostics, `statePolicy.paths.${path}`);
+		assertDiagnostic(
+			() => assertPositiveInteger(pathPolicy.maxBytes, `statePolicy.paths.${path}.maxBytes`),
+			diagnostics,
+			"STATE_PATH_LIMIT",
+			`statePolicy.paths.${path}.maxBytes`,
+		);
+	}
 }
 
 function validateGraphPolicy(definition: GraphDefinition, diagnostics: Diagnostic[]): void {
@@ -655,27 +559,52 @@ function validateGraphPolicy(definition: GraphDefinition, diagnostics: Diagnosti
 	}
 }
 
-function validateReachability(definition: GraphDefinition, diagnostics: Diagnostic[]): void {
-	const adjacency = new Map<string, Set<string>>();
-	for (const nodeId of Object.keys(definition.nodes)) adjacency.set(nodeId, new Set());
-	for (const edge of definition.edges ?? []) {
-		for (const source of asStringArray(edge.from)) {
-			const destinations = adjacency.get(source);
-			if (!destinations) continue;
-			for (const target of asStringArray(edge.to)) if (target !== END) destinations.add(target);
-		}
+function validateResultPolicy(definition: GraphDefinition, diagnostics: Diagnostic[]): void {
+	const policy = definition.result;
+	if (!policy) return;
+	for (const [index, path] of (policy.paths ?? []).entries()) validateStatePath(path, diagnostics, `result.paths.${index}`);
+	if (policy.includeState !== undefined && typeof policy.includeState !== "boolean") {
+		pushError(diagnostics, "RESULT_INCLUDE_STATE", "result.includeState must be boolean", "result.includeState");
 	}
-	for (const route of definition.routes ?? []) {
-		const destinations = adjacency.get(route.from);
-		if (!destinations) continue;
-		for (const routeCase of route.cases) for (const target of asStringArray(routeCase.to)) if (target !== END) destinations.add(target);
-		for (const target of route.default === undefined ? [] : asStringArray(route.default)) if (target !== END) destinations.add(target);
+	assertDiagnostic(() => assertPositiveInteger(policy.maxBytes, "result.maxBytes"), diagnostics, "RESULT_LIMIT", "result.maxBytes");
+}
+
+function buildGraphTopology(definition: GraphDefinition): GraphTopology {
+	const targetGroups: GraphTargetGroup[] = [{ sources: [], targets: asStringArray(definition.entry), path: "entry" }];
+	for (const [index, edge] of (definition.edges ?? []).entries()) {
+		targetGroups.push({ sources: asStringArray(edge.from), targets: asStringArray(edge.to), path: `edges.${index}.to` });
+	}
+	for (const [routeIndex, route] of (definition.routes ?? []).entries()) {
+		for (const [caseIndex, routeCase] of route.cases.entries()) {
+			targetGroups.push({
+				sources: [route.from],
+				targets: asStringArray(routeCase.to),
+				path: `routes.${routeIndex}.cases.${caseIndex}.to`,
+			});
+		}
+		if (route.default !== undefined) {
+			targetGroups.push({ sources: [route.from], targets: asStringArray(route.default), path: `routes.${routeIndex}.default` });
+		}
 	}
 	for (const [nodeId, node] of Object.entries(definition.nodes)) {
-		if (node.onError?.to !== undefined) {
-			for (const target of asStringArray(node.onError.to)) if (target !== END) adjacency.get(nodeId)?.add(target);
+		if (node.onError?.strategy !== "route" || node.onError.to === undefined) continue;
+		targetGroups.push({ sources: [nodeId], targets: asStringArray(node.onError.to), path: `nodes.${nodeId}.onError.to` });
+	}
+
+	const adjacency = new Map<string, Set<string>>();
+	for (const nodeId of Object.keys(definition.nodes)) adjacency.set(nodeId, new Set());
+	for (const group of targetGroups) {
+		for (const source of group.sources) {
+			for (const target of group.targets) if (target !== END) adjacency.get(source)?.add(target);
 		}
 	}
+	const fanOutGroups = targetGroups
+		.map((group) => group.targets.filter((target) => target !== END))
+		.filter((targets) => targets.length > 1);
+	return { targetGroups, adjacency, fanOutGroups };
+}
+
+function validateReachability(definition: GraphDefinition, adjacency: Map<string, Set<string>>, diagnostics: Diagnostic[]): void {
 	const reached = new Set<string>();
 	const queue = asStringArray(definition.entry).filter((item) => item !== END);
 	while (queue.length > 0) {
@@ -690,9 +619,25 @@ function validateReachability(definition: GraphDefinition, diagnostics: Diagnost
 }
 
 function validateAgentContexts(definition: GraphDefinition, diagnostics: Diagnostic[]): void {
+	const retentionByPath = new Map<string, { value: number; nodeId: string }>();
 	for (const [nodeId, node] of Object.entries(definition.nodes)) {
 		if (node.type !== "agent" || (node.context?.mode ?? "isolated") !== "shared") continue;
+		if ((node.context?.capture ?? "compact") === "none") continue;
 		const messagesPath = node.context?.messagesPath ?? "messages";
+		const maxStoredMessages = node.context?.maxStoredMessages;
+		if (maxStoredMessages !== undefined) {
+			const existing = retentionByPath.get(messagesPath);
+			if (existing && existing.value !== maxStoredMessages) {
+				pushWarning(
+					diagnostics,
+					"SHARED_RETENTION_MISMATCH",
+					`Shared message channel ${messagesPath} uses different maxStoredMessages values (${existing.value} on ${existing.nodeId}, ${maxStoredMessages} on ${nodeId}); runtime applies the smaller bound.`,
+					`nodes.${nodeId}.context.maxStoredMessages`,
+				);
+			} else if (!existing) {
+				retentionByPath.set(messagesPath, { value: maxStoredMessages, nodeId });
+			}
+		}
 		const reducer = definition.reducers?.[messagesPath];
 		if (reducer !== undefined && reducer !== "concat") {
 			pushError(
@@ -736,14 +681,15 @@ function resolveEffectiveReducers(definition: GraphDefinition): Record<string, R
 	const reducers = { ...(definition.reducers ?? {}) };
 	for (const node of Object.values(definition.nodes)) {
 		if (node.type !== "agent" || (node.context?.mode ?? "isolated") !== "shared") continue;
+		if ((node.context?.capture ?? "compact") === "none") continue;
 		const messagesPath = node.context?.messagesPath ?? "messages";
 		reducers[messagesPath] ??= "concat";
 	}
 	return reducers;
 }
 
-function validateParallelThreadContexts(definition: GraphDefinition, diagnostics: Diagnostic[]): void {
-	for (const group of collectFanOutGroups(definition)) {
+function validateParallelThreadContexts(definition: GraphDefinition, fanOutGroups: string[][], diagnostics: Diagnostic[]): void {
+	for (const group of fanOutGroups) {
 		const byKey = new Map<string, string[]>();
 		for (const nodeId of group) {
 			const node = definition.nodes[nodeId];
@@ -766,26 +712,65 @@ function validateParallelThreadContexts(definition: GraphDefinition, diagnostics
 	}
 }
 
-function collectFanOutGroups(definition: GraphDefinition): string[][] {
-	const groups: string[][] = [];
-	const entry = asStringArray(definition.entry).filter((item) => item !== END);
-	if (entry.length > 1) groups.push(entry);
-	for (const edge of definition.edges ?? []) {
-		const targets = asStringArray(edge.to).filter((item) => item !== END);
-		if (targets.length > 1) groups.push(targets);
+function validateAccumulatingReducersInCycles(
+	definition: GraphDefinition,
+	adjacency: Map<string, Set<string>>,
+	diagnostics: Diagnostic[],
+): void {
+	const cyclicNodes = findCyclicNodes(definition, adjacency);
+	if (cyclicNodes.size === 0) return;
+	const reducers = resolveEffectiveReducers(definition);
+	for (const [path, reducer] of Object.entries(reducers)) {
+		if (reducer !== "append" && reducer !== "concat") continue;
+		const writers = Object.entries(definition.nodes)
+			.filter(([nodeId, node]) => cyclicNodes.has(nodeId) && directWritePaths(nodeId, node).includes(path))
+			.map(([nodeId]) => nodeId);
+		if (writers.length === 0) continue;
+		if (reducer === "concat" && isBoundedSharedChannel(definition, path, writers)) continue;
+		pushWarning(
+			diagnostics,
+			"ACCUMULATING_REDUCER_IN_CYCLE",
+			`State path ${path} uses ${reducer} and is written by cyclic node(s) ${writers.join(", ")}; values survive each loop iteration. Use collect for current-round fan-in, overwrite/unset cleanup, or a bounded shared-message channel.`,
+			`reducers.${path}`,
+		);
 	}
-	for (const route of definition.routes ?? []) {
-		for (const routeCase of route.cases) {
-			const targets = asStringArray(routeCase.to).filter((item) => item !== END);
-			if (targets.length > 1) groups.push(targets);
-		}
-	}
-	return groups;
 }
 
-function validateParallelWrites(definition: GraphDefinition, diagnostics: Diagnostic[]): void {
+function isBoundedSharedChannel(definition: GraphDefinition, path: string, writers: string[]): boolean {
+	return writers.every((nodeId) => {
+		const node = definition.nodes[nodeId];
+		return (
+			node?.type === "agent" &&
+			(node.context?.mode ?? "isolated") === "shared" &&
+			(node.context?.capture ?? "compact") !== "none" &&
+			(node.context?.messagesPath ?? "messages") === path &&
+			node.context?.maxStoredMessages !== undefined
+		);
+	});
+}
+
+function findCyclicNodes(definition: GraphDefinition, adjacency: Map<string, Set<string>>): Set<string> {
+	const cyclic = new Set<string>();
+	for (const nodeId of Object.keys(definition.nodes)) {
+		const queue = [...(adjacency.get(nodeId) ?? [])];
+		const visited = new Set<string>();
+		while (queue.length > 0) {
+			const current = queue.shift();
+			if (!current || visited.has(current)) continue;
+			if (current === nodeId) {
+				cyclic.add(nodeId);
+				break;
+			}
+			visited.add(current);
+			queue.push(...(adjacency.get(current) ?? []));
+		}
+	}
+	return cyclic;
+}
+
+function validateParallelWrites(definition: GraphDefinition, fanOutGroups: string[][], diagnostics: Diagnostic[]): void {
 	const reducers = resolveEffectiveReducers(definition);
-	for (const group of collectFanOutGroups(definition)) {
+	for (const group of fanOutGroups) {
 		const paths = new Map<string, string[]>();
 		for (const nodeId of group) {
 			const node = definition.nodes[nodeId];
@@ -811,8 +796,12 @@ function validateParallelWrites(definition: GraphDefinition, diagnostics: Diagno
 
 function directWritePaths(nodeId: string, node: NodeDefinition): string[] {
 	if (node.type === "set") return node.assign.map((assignment) => assignment.path);
-	const paths = [node.output ?? `outputs.${nodeId}`];
-	if (node.type === "agent" && (node.context?.mode ?? "isolated") === "shared") {
+	const paths = node.type === "agent" && node.response?.storeOutput === false ? [] : [node.output ?? `outputs.${nodeId}`];
+	if (
+		node.type === "agent" &&
+		(node.context?.mode ?? "isolated") === "shared" &&
+		(node.context?.capture ?? "compact") !== "none"
+	) {
 		paths.push(node.context?.messagesPath ?? "messages");
 	}
 	return paths;
@@ -820,19 +809,11 @@ function directWritePaths(nodeId: string, node: NodeDefinition): string[] {
 
 function pathsOverlapForValidation(leftPath: string, rightPath: string): boolean {
 	try {
-		return pathsOverlap(leftPath, rightPath);
+		return statePathsOverlap(leftPath, rightPath);
 	} catch {
 		// The dedicated path validator already reports malformed paths.
 		return false;
 	}
-}
-
-function pathsOverlap(leftPath: string, rightPath: string): boolean {
-	const left = normalizePath(leftPath);
-	const right = normalizePath(rightPath);
-	const shorter = left.length <= right.length ? left : right;
-	const longer = shorter === left ? right : left;
-	return shorter.every((segment, index) => longer[index] === segment);
 }
 
 function validateTarget(target: string, nodeSet: Set<string>, diagnostics: Diagnostic[], path: string): void {
@@ -845,16 +826,6 @@ function validateStatePath(path: string, diagnostics: Diagnostic[], diagnosticPa
 	} catch (error) {
 		pushError(diagnostics, "STATE_PATH", String(error), diagnosticPath);
 	}
-}
-
-function validateStringOrStringArray(value: unknown, diagnostics: Diagnostic[], path: string): void {
-	if (typeof value === "string" && value.trim()) return;
-	if (isStringArray(value) && value.length > 0 && value.every((item) => item.trim())) return;
-	pushError(diagnostics, "STRING_OR_ARRAY", "Expected a non-empty string or non-empty string array", path);
-}
-
-function isStringArray(value: unknown): value is string[] {
-	return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
 function assertDiagnostic(action: () => void, diagnostics: Diagnostic[], code: string, path: string): void {
@@ -878,21 +849,8 @@ export function graphUsesMutatingTools(definition: GraphDefinition): boolean {
 		if (node.type !== "agent") continue;
 		if (node.loadExtensions === true) return true;
 		if (node.readOnly === true) continue;
-		const tools = node.tools ?? ["read", "bash", "edit", "write"];
-		if (tools.some((tool) => !READ_ONLY_TOOLS.has(tool))) return true;
+		const tools = node.tools ?? DEFAULT_AGENT_TOOL_NAMES;
+		if (tools.some((tool) => !READ_ONLY_TOOL_SET.has(tool))) return true;
 	}
 	return false;
-}
-
-export function graphSummary(definition: GraphDefinition): JsonObject {
-	const nodeTypes: JsonObject = {};
-	for (const [nodeId, node] of Object.entries(definition.nodes)) nodeTypes[nodeId] = node.type;
-	return {
-		name: definition.name,
-		description: definition.description ?? "",
-		nodes: nodeTypes,
-		entry: toJsonValue(definition.entry),
-		edges: definition.edges?.length ?? 0,
-		routes: definition.routes?.length ?? 0,
-	};
 }

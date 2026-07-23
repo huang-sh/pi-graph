@@ -2,82 +2,91 @@
 
 **English** | [中文](README.md)
 
-`pi-graph` is a state-graph extension for the [Pi agent harness](https://github.com/earendil-works/pi). It borrows the low-level orchestration ideas of [LangGraph](https://github.com/langchain-ai/langgraph) and organizes Pi agent workflows with explicit state, nodes, edges, reducers, supersteps, checkpoints and interrupts.
+Durable, auditable state-graph orchestration for the [Pi agent harness](https://github.com/earendil-works/pi).
 
-Current version: **0.0.1**.
+`pi-graph` organizes complex agent workflows with explicit state, nodes, edges, and reducers. It is designed for tasks that need parallel research, specialized roles, independent review, human approval, or failure recovery. Its execution model draws from [LangGraph](https://github.com/langchain-ai/langgraph) and Pregel, while every agent node still runs through Pi.
 
-`pi-graph` no longer forces every agent node into a one-shot isolated context. Each agent node can choose among three context semantics based on its role:
+Current version: **0.0.3** · Graph schema: **`schemaVersion: 2`**
 
-| Mode | Cross-node memory | Persistence location | Typical use |
-|---|---|---|---|
-| `isolated` | Passed only via graph state / files | No private Pi session | Independent reviewers, parallel research, one-shot experts |
-| `thread` | Same `threadKey` reuses a private Pi session | Pi JSONL session + checkpoint thread metadata | implement–review–fix loops, long-running researchers |
-| `shared` | Role-tagged messages written into graph state | graph checkpoint | ReAct-style continuous dialogue, explicit auditable handoffs |
+> Prefer a single Pi agent loop for simple work. A graph becomes worthwhile when the workflow genuinely needs parallel fan-out/fan-in, different models or tools, an independent reviewer, persistent role memory, a human gate, or failure isolation.
 
-Legacy graphs that do not declare `context` still run as `isolated`, preserving `schemaVersion: 1` backward compatibility.
+## What it solves
 
-The design follows the core constraints of the [Graph Engineering Guide (2026)](https://www.aibuilderclub.com/blog/graph-engineering-guide-2026): try a single agent loop first; reach for a graph only when the task genuinely needs specialization, parallel fan-out/fan-in, different models or tools, independent reviewers, auditable routing, persistent role memory, or failure isolation.
+A conventional agent loop works well when one context can carry the task from start to finish. More involved workflows often need to:
 
-## Features
+- run several research nodes in parallel and join only after all of them finish;
+- preserve an implementer's working memory while keeping the reviewer independent;
+- record handoffs in explicit state instead of relying on hidden chat history;
+- continue from a checkpoint after human approval, process exit, or node failure;
+- enforce hard limits on steps, concurrency, tokens, cost, time, and state size.
 
-- Explicit JSON shared state, nodes, static edges and conditional edges
-- LangGraph/Pregel-style bulk-synchronous superstep
-- Parallel fan-out, multi-source barrier fan-in, conditional branches and cyclic back-edges
-- `agent`, `set`, `human` node types
-- `isolated`, `thread`, `shared` agent context modes
-- Per-node model, thinking, tools, cwd, resource inheritance and budget
-- Atomic state commit; parallel write conflicts must declare a reducer
-- Shared message channel automatically uses the `concat` reducer
-- Durable identity, recovery and concurrency protection for thread sessions
-- Node retry, idempotency diagnostics, failure isolation and error routing
-- Durable checkpoint, failure recovery, human interrupt/resume
-- Hard graph/node-level limits on steps, node-runs, concurrency, tokens, cost, timeout, output and state size
-- Project-graph trust gate, mutating-tool confirmation, non-interactive execution policy
-- Graph visualization: `/pi-graph visualize` renders any discovered graph as a Mermaid flowchart
-- Pi tools: `pi_graph_run`, `pi_graph_resume`, `pi_graph_inspect`
-- Pi command: `/pi-graph`
+`pi-graph` puts that control flow and state behavior in a JSON graph definition that can be validated, inspected, visualized, and resumed.
 
-## Installation
+## Core capabilities
 
-Install from a local directory:
-
-```bash
-pi install ./pi-graph
-```
-
-Load directly during development:
-
-```bash
-pi --no-extensions -e ./pi-graph/extensions/pi-graph.ts
-```
-
-The Pi package manifest is declared in `package.json` under `pi.extensions`. The runtime depends only on the Pi-provided `@earendil-works/pi-coding-agent` and `typebox` peer packages.
+- Three node types: `agent`, `set`, and `human`;
+- static edges, conditional routes, loops, parallel fan-out, and barrier fan-in;
+- three agent context modes: `isolated`, `thread`, and `shared`;
+- per-node model, thinking, tools, cwd, budget, and resource inheritance;
+- deterministic parallel state merging through reducers, including current-superstep-only `collect`;
+- `overwrite` / `unset` writes, bounded shared-message retention, and per-path state budgets;
+- preflight byte limits over the graph-constructed prompt and duplicate state-injection suppression;
+- runtime-managed artifacts, result projection, and path-oriented inspection so large bodies do not return to the parent agent;
+- atomic state commits, node retries, error continuation, and fallback routes;
+- durable checkpoints, process-restart recovery, and human interrupt/resume;
+- graph- and node-level limits for steps, node runs, concurrency, tokens, cost, timeout, output, and state size;
+- project trust gates, confirmation for mutating tools, and non-interactive execution policies;
+- a live runtime node board plus pre-run Mermaid graph visualization;
+- Pi tools: `pi_graph_run`, `pi_graph_resume`, and `pi_graph_inspect`;
+- Pi command: `/pi-graph`.
 
 ## Quick start
 
-Install the example graphs:
+### 1. Install
+
+Requires Node.js `>= 22.19.0` and an installed copy of Pi.
+
+From the repository root:
+
+```bash
+pi install .
+```
+
+For extension development, load it directly:
+
+```bash
+pi --no-extensions -e ./extensions/pi-graph.ts
+```
+
+At runtime, the package adds no dependencies beyond Pi-provided peer packages and Node.js built-ins.
+
+### 2. Install an example graph
+
+User graphs are discovered from `~/.pi/agent/graphs/*.json` by default:
 
 ```bash
 mkdir -p ~/.pi/agent/graphs
-cp ./pi-graph/examples/research-review.json ~/.pi/agent/graphs/
-cp ./pi-graph/examples/shared-handoff.json ~/.pi/agent/graphs/
+cp examples/research-review.json ~/.pi/agent/graphs/
 ```
 
-After starting Pi:
+### 3. Validate and run
+
+Start Pi, then run:
 
 ```text
 /pi-graph list
 /pi-graph validate research-review
+/pi-graph visualize research-review
 /pi-graph run research-review Design a safe cache invalidation strategy for this repository
 ```
 
-A human node pauses and returns a `runId`:
+If the graph pauses at a `human` node, the command returns a `runId`:
 
 ```text
 /pi-graph resume <runId> true
 ```
 
-The model can call it too:
+The model can also call `pi_graph_run` directly:
 
 ```json
 {
@@ -87,9 +96,48 @@ The model can call it too:
 }
 ```
 
-## Agent context model
+## How it works
 
-### `isolated`: independent context
+At the start of a run, input is written to `state.input`. Within each superstep, every node reads the same immutable state snapshot. Successful writes are committed together at the end of the step, and only then does the runner schedule the next set of nodes.
+
+```text
+input
+  │
+  ▼
+entry nodes ── fan-out ──► parallel nodes
+                                │
+                                ▼ barrier
+                           join / reviewer
+                                │
+                         route / loop / end
+```
+
+This bulk-synchronous model provides two important guarantees:
+
+1. A node never sees another node's partial result from the same superstep.
+2. Parallel nodes writing to the same path must declare a reducer, or the run fails.
+
+### Node types
+
+| Type | Purpose | Calls an agent? |
+|---|---|---|
+| `agent` | Nondeterministic work such as research, implementation, or review | Yes |
+| `set` | Deterministic state writes or transformations | No |
+| `human` | Request approval, a choice, or additional input | No; pauses until resume |
+
+### Three context modes
+
+Each `agent` node should choose context semantics based on its responsibility:
+
+| Mode | Memory model | Best suited for |
+|---|---|---|
+| `isolated` | Starts a fresh Pi subprocess every time; information flows only through state, files, and context files | Independent reviewers, parallel research, one-shot experts |
+| `thread` | Reuses a private Pi JSONL session for the same `threadKey` | Implement–review–fix loops, persistent researchers |
+| `shared` | Writes role-tagged messages into graph state and projects them into later prompts | Auditable handoffs, ReAct-style collaboration |
+
+Nodes without an explicit `context` run as `isolated`.
+
+#### `isolated`: independent judgment
 
 ```json
 {
@@ -102,21 +150,9 @@ The model can call it too:
 }
 ```
 
-Each invocation spawns a fresh sessionless Pi subprocess:
+The node does not inherit Pi message history from any other node. Cross-node information must live in graph state, real artifacts in the shared working directory, or stable Pi context files.
 
-```text
-pi --mode json -p --no-session ...
-```
-
-The node does not inherit other nodes' Pi message history. Cross-node information must flow through:
-
-1. graph state, e.g. `draft`, `review.requiredChanges`
-2. real artifacts in the shared working directory, e.g. code and test output
-3. Pi context files, e.g. a stable `AGENTS.md`
-
-Suited to independent reviewers, parallel research branches, one-shot experts, and nodes that need a strong failure boundary.
-
-### `thread`: private persistent Pi session
+#### `thread`: private persistent session
 
 ```json
 {
@@ -130,32 +166,26 @@ Suited to independent reviewers, parallel research branches, one-shot experts, a
 }
 ```
 
-Nodes sharing a `threadKey` sequentially reuse the same Pi session:
+Nodes with the same `threadKey` sequentially reuse one Pi session. This lets a role retain working memory across a loop:
 
 ```text
 planner(threadKey=coder)
   → implementer(threadKey=coder)
-  → isolated reviewer
+  → reviewer(isolated)
   → implementer(threadKey=coder)
 ```
 
-On the second entry to `implementer`, Pi sees the existing messages and tool working memory of the `coder` private session; the current graph state remains the authoritative input, and the node prompt should keep explicitly referencing the plan, review outcome and control state.
-
-Thread metadata is stored in the graph checkpoint; the private Pi session lives by default at:
+Thread metadata is stored in the graph checkpoint. By default, the private session lives at:
 
 ```text
 ~/.pi/agent/pi-graph/threads/<runId>/<sessionId>.jsonl
 ```
 
-Constraints:
+The same `threadKey` cannot run concurrently within one superstep or span different `cwd` values. If a previously used session file is missing, recovery fails instead of silently starting a new role memory.
 
-- When `threadKey` is omitted, it defaults to the node id.
-- The same `threadKey` cannot run concurrently within one superstep.
-- Nodes sharing a `threadKey` must use the same `cwd`.
-- If the private session file is lost, recovery fails; the runner never silently resets role memory.
-- A thread retry re-appends the prompt to the same session, so the compiler emits a `THREAD_RETRY_APPENDS_HISTORY` warning. Production graphs should usually set `maxAttempts` to `1` on thread nodes and let the graph loop handle revision iterations.
+A thread retry appends another prompt to the same session. Production graphs should generally set `maxAttempts` to `1` for thread nodes and use an explicit graph loop for revisions.
 
-### `shared`: explicit shared message channel
+#### `shared`: auditable message channel
 
 ```json
 {
@@ -164,76 +194,67 @@ Constraints:
   "context": {
     "mode": "shared",
     "messagesPath": "conversation.messages",
+    "capture": "compact",
     "maxMessages": 32,
-    "maxPromptBytes": 65536
+    "maxPromptBytes": 65536,
+    "maxStoredMessages": 32
   },
   "output": "analysis"
 }
 ```
 
-A successful node appends the current user instruction, assistant messages and tool results to the specified state path:
+`shared` does not make multiple nodes share a hidden Pi session. Instead, it keeps role-tagged messages as ordinary graph state and projects them into the prompt of a fresh process. Partial messages from failed or interrupted nodes are never committed.
+
+The default is `capture: "compact"`: the channel stores one small assistant reference message while the node output path remains the canonical value. When the next node already projects that state path through its template or `reads`, runtime does not expand the reference again. Other modes are `none`, `assistant-only` (useful with `storeOutput: false`), and explicit `full` transcript capture.
+
+`maxMessages` bounds one prompt projection. `maxStoredMessages` is the durable retention bound: after every commit the engine removes the oldest messages beyond that limit.
+
+A compact decision guide:
+
+```text
+One role needs private working memory across loops  → thread
+Several nodes need an auditable conversation        → shared
+A node needs independent judgment or parallel isolation → isolated
+A plain deterministic state transformation          → set
+The workflow needs approval or human input          → human
+```
+
+## State and token hygiene
+
+Treat graph state as a bounded hot working set, not as a document store:
+
+```text
+working  round-scoped temporary data, explicitly unset before refinement
+memory   compact cross-round summaries
+result   final summaries and artifact references
+```
+
+Use `collect` for parallel results that must replace the previous round, `set.assign[].mode: "unset"` for obsolete state, `response.storage: "artifact"` for full reports/transcripts, graph/node prompt preflight limits, `limits.maxStateBytes` for total state, `statePolicy.paths` for exact path budgets, and top-level `result.paths` to keep the full internal state out of the parent Pi context.
 
 ```json
 {
-  "role": "assistant",
-  "content": "...",
-  "nodeId": "analyst",
-  "name": null,
-  "createdAt": "2026-07-21T12:00:00.000Z"
+  "reducers": { "working.branch_results": "collect" },
+  "limits": { "maxStateBytes": 131072 },
+  "statePolicy": {
+    "paths": { "working.reviewed_evidence": { "maxBytes": 8192 } }
+  },
+  "result": {
+    "paths": ["result.executive_summary", "result.report_artifact"],
+    "includeState": false,
+    "maxBytes": 8192
+  }
 }
 ```
 
-`messagesPath` automatically gets the `concat` reducer, so parallel shared nodes can deterministically append their messages to the same channel. Configuring a different reducer explicitly is rejected.
+Prompt preflight covers the parts constructed by `pi-graph`: the node instruction, shared transcript, `reads`, response contract, and node system prompt. It does not include Pi's base system prompt, tool schemas, automatically loaded context/skills/extensions, provider framing, or prior private history in a thread session. Continue to use conservative limits, actual usage accounting, and context compaction for those inputs.
 
-The current implementation injects the most recent role-tagged messages as an **explicit transcript projection** into a fresh Pi subprocess, rather than letting multiple nodes share one hidden Pi session. This makes messages ordinary graph state: inspectable, trimmable, checkpointable and mergeable by a reducer. By default at most the latest 32 messages and 64 KiB of UTF-8 text are injected; tighten this via `maxMessages` and `maxPromptBytes`.
+## Minimal graph definition
 
-Only shared messages from successful nodes are committed atomically with the step. Failed or interrupted nodes never write half-finished messages into graph state.
-
-### How to choose
-
-```text
-A role needs working memory preserved across loops      → thread
-Multiple nodes need to share an auditable conversation  → shared
-A node must judge independently or run in parallel      → isolated
-A plain deterministic transform                         → set
-Needs approval, a choice, or supplementary input        → human
-```
-
-Recommended combinations:
-
-```text
-planner/thread ─→ implementer/thread ─→ reviewer/isolated
-                         ↑                    │
-                         └──── required changes ────┘
-```
-
-or:
-
-```text
-analyst/shared → writer/shared → reviewer/isolated
-```
-
-## Graph discovery directories
-
-User graphs:
-
-```text
-~/.pi/agent/graphs/*.json
-```
-
-Project graphs:
-
-```text
-<project>/.pi/graphs/*.json
-```
-
-With `scope: "both"`, project graphs override same-named user graphs by `name`. Project graphs are discovered only after Pi has trusted the project; interactive mode additionally shows a graph-level confirmation by default. Tools accept only discovered graph names, never arbitrary file paths.
-
-## Minimal graph
+In this graph, a researcher produces source material, a writer retains revision context, and an independent reviewer decides whether the run should end:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "name": "research-review",
   "entry": "researcher",
   "nodes": {
@@ -258,7 +279,9 @@ With `scope: "both"`, project graphs override same-named user graphs by `name`. 
       "readOnly": true,
       "context": { "mode": "isolated" },
       "output": "review",
-      "response": { "format": "json" }
+      "response": { "format": "json" },
+      "retry": { "maxAttempts": 3, "backoffMs": 500 },
+      "idempotent": true
     }
   },
   "edges": [
@@ -289,181 +312,141 @@ With `scope: "both"`, project graphs override same-named user graphs by `name`. 
 }
 ```
 
-For the full schema see [`docs/SCHEMA.md`](docs/SCHEMA.md).
+See the [graph schema](docs/SCHEMA.md) for every available field.
 
-## Graph visualization
+## State, reducers, and control flow
 
-`/pi-graph visualize <graph>` renders any discovered graph as a Mermaid `flowchart LR` and displays it directly in the Pi TUI. The structure comes straight from the graph definition; it renders even when compile errors exist, which helps debug control-flow issues.
+Nodes read state through `{{path.to.value}}` templates and optional `reads`. They write through `output`, `set.assign`, or a shared message channel.
 
-```text
-/pi-graph visualize research-review
-```
-
-The output contains a summary header (node / edge / route counts, or the number of compile errors) and a Mermaid code block. The diagrams below are pre-rendered to SVG from the same rendering logic (`generateMermaid`) via `npm run render:graphs` and committed to the repo, so they are visible on GitHub, npm, and any viewer that does not render Mermaid.
-
-### Node shapes
-
-| Type | Shape | Mermaid syntax |
-|---|---|---|
-| `agent` | stadium (rounded rectangle) | `id([id])` |
-| `set` | subroutine (double-bordered rectangle) | `id[[id]]` |
-| `human` | hexagon | `id{id}` |
-| `__end__` | circle | `__end__((end))` |
-
-Entry nodes (real node ids listed in `entry`) are marked with a green bold border: `classDef entry stroke:#2a2,stroke-width:3px;`.
-
-### Edges and routing
-
-- Static edge: solid arrow `a --> b`. When `from`/`to` is an array, it expands into all combinations, so fan-out and barrier fan-in appear as multiple parallel arrows.
-- Conditional route: dashed arrow with a condition label `a -. "label" .-> b`; an unmatched `default` branch is labeled `else`.
-- Condition labels are produced by the condition DSL: `all`/`any`/`not` render as `∧`/`∨`/`¬`, comparison operators map to `==`, `!=`, `>`, `≥`, `<`, `≤`, etc.; any `"` in a label is replaced with `'` to keep the Mermaid syntax valid.
-
-### Example: parallel research + thread writer + independent reviewer
-
-`/pi-graph visualize research-review` renders as:
-
-![research-review graph](docs/images/research-review.svg)
-
-The two entry nodes (parallel isolated research) barrier-join at the writer; the reviewer's conditional route goes to `__end__` when the bar is met, otherwise returns to the writer with an `else` label to form a revision loop.
-
-### Example: parallel fan-out + barrier tournament
-
-`/pi-graph visualize idea-tournament` shows how three parallel ideator branches converge on the barrier node `judge` through a single edge:
-
-![idea-tournament graph](docs/images/idea-tournament.svg)
-
-### Other example diagrams
-
-`coding-review` (thread coder + independent reviewer + human approval, two layers of conditional loops):
-
-![coding-review graph](docs/images/coding-review.svg)
-
-`shared-handoff` (explicit shared message channel + isolated reviewer revision loop):
-
-![shared-handoff graph](docs/images/shared-handoff.svg)
-
-`science-research` (human scope gate + conditional refinement loop, parallel fan-out + barrier, conflict-triggered shared adversarial debate, thread integrator with nested conditional routing, deterministic archiving set node, branch error-continue):
-
-![science-research graph](docs/images/science-research.svg)
-
-`science-research-auto` (a fully-autonomous variant of `science-research`: the human scope gate is replaced by an isolated agent reviewer node `scope_review` that self-judges approve/refine; all other mechanics are preserved — parallel fan-out + barrier, shared adversarial debate, thread integrator with nested conditional routing, refinement loop. Suited to headless / CI runs with no human in the loop):
-
-![science-research-auto graph](docs/images/science-research-auto.svg)
-
-### Regenerating
-
-After editing `examples/*.json`, re-run the script to refresh every SVG (it calls the same `generateMermaid` as `/pi-graph visualize`, so output stays consistent with the TUI):
-
-```bash
-npm run render:graphs
-```
-
-`docs/images/*.svg` are committed to the repo, so readers see the diagrams without running anything; `@mermaid-js/mermaid-cli` is a devDependency only and never enters the runtime.
-
-## State and reducers
-
-Runtime state is a JSON object. Initial input lives at `state.input`; the graph's `initialState` is deep-merged with the invocation input. Nodes read state via templates `{{path.to.value}}` and optional `reads`, and write via `output`, the shared message channel, or `set.assign`.
-
-All nodes within a superstep read the same immutable snapshot. When nodes finish, their write-sets are committed at once. If two parallel nodes write the same path without a reducer, the run fails; a parent path and a child path written in the same superstep are also rejected.
-
-Supported:
+Parallel writes to the same path require a reducer on that path:
 
 - `replace`
-- `append`
+- `append`: accumulate history across supersteps
+- `collect`: collect only the current superstep and replace the previous round
 - `concat`
 - `merge`
 - `sum`
 - `min`
 - `max`
 
-## Edges, parallelism and loops
+A parent path and one of its child paths cannot both be written in the same superstep. `set.assign[].mode` defaults to `reduce`; `overwrite` bypasses the reducer and `unset` removes the path. The compiler emits `ACCUMULATING_REDUCER_IN_CYCLE` when a cyclic node keeps writing an `append`/`concat` channel; bounded shared channels with `maxStoredMessages` are exempt.
 
-Plain edge:
-
-```json
-{ "from": "a", "to": "b" }
-```
-
-fan-out:
-
-```json
-{ "from": "a", "to": ["b", "c"] }
-```
-
-barrier fan-in:
-
-```json
-{ "from": ["b", "c"], "to": "join" }
-```
-
-conditional route:
+Common control-flow patterns:
 
 ```json
 {
-  "from": "reviewer",
-  "cases": [
-    { "when": { "path": "review.approved", "op": "eq", "value": true }, "to": "__end__" }
+  "edges": [
+    { "from": "plan", "to": ["research_a", "research_b"] },
+    { "from": ["research_a", "research_b"], "to": "join" }
   ],
-  "default": "writer"
+  "routes": [
+    {
+      "from": "reviewer",
+      "cases": [
+        { "when": { "path": "review.approved", "op": "eq", "value": true }, "to": "__end__" }
+      ],
+      "default": "writer"
+    }
+  ]
 }
 ```
 
-The condition DSL never uses `eval`. It supports `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `exists`, `truthy`, `includes`, `matches`, plus `all`, `any`, `not`.
+The condition DSL never uses `eval`. It supports `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `exists`, `truthy`, `includes`, and `matches`, plus the combinators `all`, `any`, and `not`.
 
-## Durable execution
+## Graph discovery and commands
 
-Graph checkpoints are written by default to:
+Graphs are discovered from two locations:
+
+| Scope | Path |
+|---|---|
+| User graphs | `~/.pi/agent/graphs/*.json` |
+| Project graphs | `<project>/.pi/graphs/*.json` |
+
+When scope is `both`, a project graph overrides a same-named user graph. Project graphs are discovered only after Pi trusts the current project. Tools accept discovered graph names only, never arbitrary file paths.
+
+Available commands:
+
+```text
+/pi-graph list
+/pi-graph validate [graph]
+/pi-graph run <graph> [task or JSON object]
+/pi-graph resume <runId> [value or JSON]
+/pi-graph inspect [runId] [--full|--inventory|state.path]
+/pi-graph visualize <graph>
+```
+
+Corresponding model tools:
+
+| Tool | Purpose |
+|---|---|
+| `pi_graph_run` | Run a discovered graph by name; input is written to `state.input` |
+| `pi_graph_resume` | Resume by `runId`, optionally submitting human input |
+| `pi_graph_inspect` | Inspect a compact checkpoint summary, inventory, selected state path, or explicitly requested full record |
+
+### Inspection is summary-first
+
+`/pi-graph inspect <runId>` returns status, usage, pending/in-flight work, total state bytes, and the largest state paths. Use `--inventory`, a dotted state path, or explicit `--full` for deeper inspection. Only `--full` renders the complete checkpoint, still under a byte cap.
+
+## Visualization and examples
+
+Runs started through `/pi-graph run`, `/pi-graph resume`, `pi_graph_run`, or `pi_graph_resume` automatically show a live board below the editor, bounded to ten lines. It reports the current superstep, active/completed counts, queued/running/retrying/failed nodes, outgoing edges or routes, elapsed time, tokens, and cost, and is cleared on every exit path. Tool-driven runs stream the same snapshot into the in-progress tool result instead of rendering a blank card.
+
+`/pi-graph visualize <graph>` generates a Mermaid `flowchart LR` from a discovered graph that passes compilation. Use it to inspect entry points, parallel branches, barriers, and conditional loops before a run.
+
+### Parallel research, persistent writer, independent reviewer
+
+The [research-review example](examples/research-review.json) combines parallel isolated research, a barrier join, a thread writer, an isolated reviewer, targeted evidence repair, and a bounded best-effort exit:
+
+![research-review graph](docs/images/research-review.svg)
+
+### Implementation, review, and human approval
+
+The [coding-review example](examples/coding-review.json) combines a thread coder, an independent reviewer, human approval, and conditional revision loops:
+
+![coding-review graph](docs/images/coding-review.svg)
+
+### Full example list
+
+| Example | Demonstrates |
+|---|---|
+| [research-review](examples/research-review.json) | Parallel research, barrier join, evidence repair, thread writer, independent reviewer, bounded fallback |
+| [coding-review](examples/coding-review.json) | Persistent coder, independent review, human approval, revision loops |
+| [shared-handoff](examples/shared-handoff.json) | Shared message channel, independent reviewer |
+| [idea-tournament](examples/idea-tournament.json) | Three-way fan-out, `append` reducer, barrier judge |
+| [science-research](examples/science-research.json) | Human scope gate, current-round `collect`, bounded shared debate, explicit cleanup, artifact report |
+| [science-research-auto](examples/science-research-auto.json) | Fully autonomous variant with the same bounded-state and artifact semantics |
+
+After editing `examples/*.json`, regenerate the committed SVG files with:
+
+```bash
+npm run render:graphs
+```
+
+## Checkpoints, recovery, and error handling
+
+Checkpoints are written by default to:
 
 ```text
 ~/.pi/agent/pi-graph/runs/<runId>.json
 ```
 
-Atomic writes happen before each superstep starts, after each successful node, after step commit, and on interrupt/failure/end. Successful nodes in a parallel step are kept in `inFlight.completed`; recovery re-executes only unresolved nodes.
+That file is a human-readable mirror of the latest checkpoint for inspection and backup. The authoritative lease, revision, and CAS state lives under `.journal/<runId>/` in the same directory. The journal appends immutable operation records and checkpoint blobs, using an atomic hard link to claim the one valid next sequence number. Sequence claims are never deleted or reused, preventing ABA when a paused process resumes.
 
-Checkpoints store a graph hash. Recovery is refused by default after the definition changes; `forceGraphVersion` should be used only after you have manually verified state compatibility and side-effect idempotency.
+Every durable run acquires an exclusive lease before execution and renews it in the background. While that lease is unexpired, a second executor for the same `runId` receives `RUN_LEASE_HELD` and cannot enter node execution; after a process crash or long stall, takeover is allowed only after the old lease expires. Every save uses the current revision as a CAS condition, so a stale revision or lost lease cannot overwrite the winner. A new run is already durable at revision 1 before `open(create)` returns; it does not depend on the engine's first later save.
 
-Thread mode adds a second persistence layer:
+Checkpoints use a `formatVersion: 2` envelope containing a monotonically increasing `revision` and the `snapshot`. Load, create, and every commit run the complete schema validator over usage, history, threads, in-flight results, interrupts, UUID session IDs, plain JSON containers, finite non-negative counters, and status invariants. Across revisions it also prevents graph identity, timestamps, steps, node runs, usage, counts, history, or thread progress from moving backwards or being rewritten. Other checkpoint formats are rejected.
 
-```text
-graph checkpoint
-  ├─ state / routing / usage / inFlight
-  └─ threadKey → stable Pi sessionId
+The runner writes checkpoints atomically before a superstep starts, records successful results after the parallel batch returns, writes again after step commit, and persists interrupt, failure, and completion states. Nodes already present in `inFlight.completed` are not rerun. If the process exits before the whole parallel batch returns, a sibling that completed only in process is still unresolved and will run again during recovery.
 
-Pi session JSONL
-  └─ that role's private message/tool history
-```
+Each checkpoint stores a graph hash. Recovery is rejected by default after the graph definition changes. Use `forceGraphVersion` only after manually verifying state compatibility and side-effect idempotency.
 
-## Graph-engineering constraints
-
-1. **Loop first**: a single-node graph produces a warning; simple tasks should use a plain Pi loop.
-2. **Real specialties**: nodes should represent genuine responsibility boundaries, not inlinable steps disguised as roles.
-3. **Explicit edges/state**: control flow, input dependencies, output paths and reducers are all reviewable.
-4. **Choose memory deliberately**: `isolated`, `thread`, `shared` must be chosen by role semantics.
-5. **Reviewer with teeth**: `purpose: "reviewer"` without `readOnly` warns; a non-isolated reviewer also warns.
-6. **Failure isolation**: graph state is not committed before a node succeeds; retry, continue and error routing are supported.
-7. **Hard bounds**: steps, node runs, concurrency, tokens, cost, timeout, output and state all have hard limits.
-8. **No hidden recursive graphing**: the three pi-graph tools are disabled inside child Pi.
-
-## Failures and retries
-
-By default a failure stops the graph and keeps the in-flight checkpoint:
+By default, a node failure stops the graph and preserves the checkpoint:
 
 ```json
-"onError": { "strategy": "fail" }
+{ "onError": { "strategy": "fail" } }
 ```
 
-Record the error and continue:
-
-```json
-{
-  "onError": {
-    "strategy": "continue",
-    "output": "errors.research"
-  }
-}
-```
-
-Divert to a fallback:
+A graph can instead record the error and continue, or route to a fallback:
 
 ```json
 {
@@ -475,7 +458,9 @@ Divert to a fallback:
 }
 ```
 
-Retries for ordinary isolated/shared nodes:
+`to` is valid only with `strategy: "route"`; `fail` and `continue` retain their fixed routing semantics.
+
+Retry example:
 
 ```json
 {
@@ -488,39 +473,39 @@ Retries for ordinary isolated/shared nodes:
 }
 ```
 
-`idempotent: true` is a design declaration; it does not automatically make external side effects idempotent. A thread-mode retry also reuses a private session that may already have changed, so be extra careful.
+`response.format: "json"` appends a strict output instruction and parses the final text, but it is not a provider-level schema guarantee. Invalid JSON is a retryable node failure; missing fields or wrong JSON types must still be handled by graph routes and fallbacks.
 
-## Security model
+`onError` handles node failures only. An `approved: false` review is a successful node result, and `maxSteps` is a graph-level hard limit, so neither triggers the reviewer's `onError`. A loop that needs graceful degradation should count rounds in state and route to a best-effort or human node before reaching the hard limit; keep `maxSteps` as the final guardrail.
 
-- Project graphs are discovered only in trusted projects.
-- Project graphs require interactive confirmation by default.
-- Graphs containing `bash/edit/write` or unknown extension tools require extra confirmation by default.
+`idempotent: true` is a design declaration; it does not make external side effects idempotent automatically. Checkpoints provide at-least-once recovery semantics, not exactly-once external side effects.
+
+When exposed as Pi tools, `failed`, `cancelled`, and execution exceptions are thrown into Pi's real tool-error channel. An `interrupted` run remains a normal resumable result.
+
+## Security boundaries
+
+- Project graphs are discovered only in trusted projects, and interactive runs show a graph-level confirmation by default.
+- Graphs using `bash`, `edit`, `write`, or unknown extension tools require additional confirmation by default.
 - Non-interactive runs must set `policy.allowNonInteractive: true`.
-- Non-interactive mutations must additionally set `policy.allowNonInteractiveMutations: true`.
-- Thread session directories use restricted permissions; a lost session that has been used is never silently rebuilt.
-- State paths reject `__proto__`, `prototype` and `constructor`.
-- `readOnly` is a tool allowlist, not an OS sandbox.
+- Non-interactive mutations must also set `policy.allowNonInteractiveMutations: true`.
+- State paths, node IDs, and thread/control-map keys reject `__proto__`, `prototype`, and `constructor`.
+- Child Pi processes disable all three pi-graph tools to prevent hidden recursive graph calls.
+- `readOnly` restricts the tool allowlist; it is not an operating-system sandbox.
 
-## Pi tools and commands
+Run high-risk workflows inside a container or OS sandbox. Do not treat graph-level `readOnly` as system-level permission isolation.
 
-Tools:
+## Known limitations
 
-- `pi_graph_run`: run by graph name; input goes to `state.input`
-- `pi_graph_resume`: resume by `runId`; can submit human input
-- `pi_graph_inspect`: inspect a checkpoint, thread metadata, or recent runs
+- `shared` is an explicit transcript projection, not provider-native message-array injection.
+- With `thread`, the graph checkpoint and Pi JSONL session are separate persistent objects; back them up, migrate them, and clean them up together.
+- A thread node can crash after its session history is appended but before the checkpoint is updated, so recovery may repeat the current prompt.
+- The file checkpoint adapter's journal/hard-link lease/CAS protocol targets a same-host local filesystem with atomic hard-link support; it is not a cross-host distributed coordination protocol.
+- Full power-loss durability also requires directory `fsync`; platforms without it provide only best-effort metadata durability. Append-only lease entries and old snapshot blobs grow with long-running runs. Deleting a run removes blobs but retains anti-resurrection sequence claims and a tombstone, so continue to monitor inode use and rotate or archive a checkpoint root only after ruling out stale processes and future reuse of its `runId` values.
+- Lease/CAS fences checkpoint commits, not external effects a node has already issued. If an old process is paused beyond its TTL, it can briefly overlap a replacement after resuming and before its next heartbeat or commit detects lease loss; mutations still need idempotency keys or downstream fencing tokens.
+- Token and cost limits depend on provider usage events; one in-flight response may slightly exceed a limit before termination.
+- Barriers pair each source by completion count, and the same target is executed only once within a superstep.
+- The graph format is `schemaVersion: 2`; other schema versions are rejected.
 
-Command:
-
-```text
-/pi-graph list
-/pi-graph validate [graph]
-/pi-graph run <graph> [task or JSON object]
-/pi-graph resume <runId> [value or JSON]
-/pi-graph inspect [runId]
-/pi-graph visualize <graph>
-```
-
-## Development and validation
+## Development
 
 ```bash
 npm run check
@@ -528,37 +513,14 @@ npm test
 npm run validate:examples
 ```
 
-Test coverage:
+The `prepublishOnly` hook runs all three checks before publication.
 
-- All three context modes and default backward compatibility
-- Shared message append, injection into the next node, and implicit reducer
-- Thread session resumption across graph interrupt / process restart
-- Fail-closed behavior when a thread session is lost
-- Reviewer isolation, thread cwd and concurrency diagnostics
-- Conditional loops, fan-out/fan-in barrier
-- Parallel state conflicts and reducers
-- Retry, failure isolation, human interrupt/resume
-- Checkpoint persistence and the Pi NDJSON event protocol
-- Strict TypeBox / Pi ExtensionAPI type checking
+## Further reading
 
-## Important boundaries
+- [Schema reference](docs/SCHEMA.md) (Chinese): complete graph format, node fields, and context configuration;
+- [Architecture](docs/ARCHITECTURE.md) (Chinese): supersteps, four memory planes, checkpoints, and failure semantics;
+- [Changelog](CHANGELOG.md): release history.
 
-- `shared` is an explicit prompt projection of a role-tagged transcript; it is not a provider-native message-array injection, nor is it multiple nodes sharing one Pi session.
-- `thread` provides real Pi session continuity, but the graph checkpoint and the Pi JSONL are two separate persistence objects; backup, migration and cleanup must handle both.
-- Checkpoints provide at-least-once recovery semantics and do not guarantee exactly-once external side effects.
-- A thread node may crash after the Pi session has appended history but before the graph checkpoint is updated; recovery may repeat the current prompt.
-- Cost/token limits rely on provider usage events; a single in-flight response may slightly overshoot before termination.
-- `readOnly` does not restrict OS permissions; high-risk execution should use a container or OS sandbox.
-- Barriers pair on each source's completion count; the same target within a superstep is deduplicated and executed once.
-- The graph format is still `schemaVersion: 1`.
+## License
 
-## Examples and documentation
-
-- [`docs/SCHEMA.md`](docs/SCHEMA.md): full graph format and context schema
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): superstep, three-layer memory, checkpoint and failure semantics
-- [`examples/research-review.json`](examples/research-review.json): parallel isolated research + thread writer + isolated reviewer
-- [`examples/coding-review.json`](examples/coding-review.json): shared coder thread + independent reviewer + human approval
-- [`examples/shared-handoff.json`](examples/shared-handoff.json): explicit shared message channel + isolated reviewer
-- [`examples/idea-tournament.json`](examples/idea-tournament.json): parallel fan-out (3 ideators) + `append` reducer aggregation + barrier judge tournament
-- [`examples/science-research.json`](examples/science-research.json): complex non-linear research graph for stressing the engine — human scope gate + refinement loop, parallel fan-out + barrier, shared adversarial debate (devil's advocate ↔ defender), thread integrator with nested conditional routing, a deterministic archiving `set` node, and `onError: continue` on branches
-- [`examples/science-research-auto.json`](examples/science-research-auto.json): fully-autonomous variant of `science-research` — replaces the human scope gate with an isolated agent reviewer (`scope_review`) that self-judges approve/refine, suited to headless runs; preserves parallel fan-out + barrier, shared adversarial debate, thread integrator with nested conditional routing, and the refinement loop
+[MIT](LICENSE)

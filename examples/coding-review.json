@@ -1,12 +1,11 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "name": "coding-review",
   "description": "Plan, implement, independently review, and require human approval before accepting a code change.",
   "entry": "planner",
   "nodes": {
     "planner": {
       "type": "agent",
-      "purpose": "worker",
       "description": "Create a repository-grounded implementation plan before any mutation.",
       "prompt": "Plan this code change:\n\n{{input.task}}\n\nInspect the repository and return a precise plan with affected files, invariants, tests, and rollback considerations.",
       "readOnly": true,
@@ -33,12 +32,7 @@
     },
     "implementer": {
       "type": "agent",
-      "purpose": "worker",
       "description": "Apply the approved plan in the working tree and report exact changes and verification performed.",
-      "reads": [
-        "plan",
-        "review"
-      ],
       "prompt": "Implement this task in the repository:\n\n{{input.task}}\n\nPlan:\n{{plan}}\n\nReviewer feedback from a prior pass, when present:\n{{review}}\n\nMake the smallest coherent change, run appropriate verification, and report modified files, commands, results, and remaining risks.",
       "readOnly": false,
       "tools": [
@@ -70,10 +64,6 @@
       "type": "agent",
       "purpose": "reviewer",
       "description": "Review the changed repository independently without modifying it.",
-      "reads": [
-        "plan",
-        "implementation"
-      ],
       "prompt": "Independently review the repository after implementation of:\n\n{{input.task}}\n\nPlan:\n{{plan}}\n\nImplementer report:\n{{implementation}}\n\nInspect the actual files. Return JSON with exactly: {\"approved\": boolean, \"blockingIssues\": string[], \"nonBlockingIssues\": string[], \"evidence\": string[]}.",
       "readOnly": true,
       "tools": [
@@ -104,7 +94,6 @@
     },
     "approval": {
       "type": "human",
-      "purpose": "router",
       "description": "Require an explicit human release decision after independent review.",
       "kind": "confirm",
       "prompt": "Independent review passed. Accept the implementation?\n\nReviewer report:\n{{review}}",

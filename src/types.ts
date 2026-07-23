@@ -8,12 +8,14 @@ export interface JsonObject {
 
 export type GraphScope = "user" | "project" | "both";
 export type GraphStatus = "running" | "interrupted" | "completed" | "failed" | "cancelled";
-export type NodePurpose = "worker" | "reviewer" | "router" | "deterministic";
-export type ReducerName = "replace" | "append" | "concat" | "merge" | "sum" | "min" | "max";
+export type ReducerName = "replace" | "append" | "collect" | "concat" | "merge" | "sum" | "min" | "max";
+export type StateWriteMode = "reduce" | "overwrite" | "unset";
 export type OnErrorStrategy = "fail" | "continue" | "route";
 export type HumanInputKind = "confirm" | "input" | "select";
 export type AgentResponseFormat = "text" | "json";
 export type AgentContextMode = "isolated" | "thread" | "shared";
+export type SharedCaptureMode = "none" | "compact" | "assistant-only" | "full";
+export type AgentOutputStorage = "state" | "artifact";
 export type GraphMessageRole = "user" | "assistant" | "tool";
 export type ConditionOperator =
 	| "eq"
@@ -44,6 +46,8 @@ export interface GraphLimits {
 	maxTokens?: number;
 	timeoutMs?: number;
 	maxStateBytes?: number;
+	/** Maximum UTF-8 bytes sent to any single agent, including its node system prompt. */
+	maxPromptBytes?: number;
 }
 
 export interface NodeLimits {
@@ -51,7 +55,8 @@ export interface NodeLimits {
 	maxTurns?: number;
 	maxTokens?: number;
 	maxCostUsd?: number;
-	maxOutputBytes?: number;
+	/** Hard preflight limit over the complete rendered prompt plus node system prompt. */
+	maxPromptBytes?: number;
 }
 
 export interface RetryPolicy {
@@ -69,6 +74,14 @@ export interface NodeErrorPolicy {
 export interface AgentResponsePolicy {
 	format?: AgentResponseFormat;
 	maxBytes?: number;
+	/** Write the final output to the node output path. Defaults to true. */
+	storeOutput?: boolean;
+	/** Keep output inline in graph state or persist it as a runtime-managed artifact reference. */
+	storage?: AgentOutputStorage;
+	/** Artifact media type. Defaults from response format. */
+	mediaType?: string;
+	/** UTF-8 preview bytes retained in an artifact reference. Default: 2048. */
+	previewBytes?: number;
 }
 
 export interface AgentContextPolicy {
@@ -82,6 +95,12 @@ export interface AgentContextPolicy {
 	maxMessages?: number;
 	/** Maximum UTF-8 bytes of shared transcript injected into one node prompt. */
 	maxPromptBytes?: number;
+	/** Maximum UTF-8 bytes retained for one captured message. Default: 8192. */
+	maxMessageBytes?: number;
+	/** Optional durable retention bound for the shared state channel. Oldest messages are pruned after commit. */
+	maxStoredMessages?: number;
+	/** Messages committed after a successful shared invocation. Default: compact. */
+	capture?: SharedCaptureMode;
 }
 
 export interface GraphMessage extends JsonObject {
@@ -90,12 +109,15 @@ export interface GraphMessage extends JsonObject {
 	nodeId: string;
 	createdAt: string;
 	name: string | null;
+	/** Canonical state output path when compact capture stores a reference. */
+	statePath: string | null;
+	/** Content hash captured with statePath so overwritten paths cannot masquerade as historical output. */
+	stateHash: string | null;
 }
 
 export interface BaseNodeDefinition {
 	type: "agent" | "set" | "human";
 	description?: string;
-	purpose?: NodePurpose;
 	reads?: string[];
 	output?: string;
 	retry?: RetryPolicy;
@@ -106,6 +128,7 @@ export interface BaseNodeDefinition {
 
 export interface AgentNodeDefinition extends BaseNodeDefinition {
 	type: "agent";
+	purpose?: "reviewer";
 	prompt: string;
 	systemPrompt?: string;
 	model?: string;
@@ -126,6 +149,8 @@ export interface StateAssignment {
 	value?: JsonValue;
 	template?: string;
 	from?: string;
+	/** reduce uses the path reducer, overwrite bypasses it, unset removes the path. */
+	mode?: StateWriteMode;
 }
 
 export interface SetNodeDefinition extends BaseNodeDefinition {
@@ -179,6 +204,15 @@ export interface RouteDefinition {
 	default?: string | string[];
 }
 
+export interface StatePathPolicy {
+	maxBytes?: number;
+}
+
+export interface GraphStatePolicy {
+	/** Exact state-path budgets checked after every superstep commit. */
+	paths?: Record<string, StatePathPolicy>;
+}
+
 export interface GraphPolicy {
 	allowNonInteractive?: boolean;
 	allowNonInteractiveMutations?: boolean;
@@ -186,8 +220,17 @@ export interface GraphPolicy {
 	confirmMutatingNodes?: boolean;
 }
 
+export interface GraphResultPolicy {
+	/** State paths projected into the user-facing graph result. */
+	paths?: string[];
+	/** Explicitly include the complete state in the user-facing result. Default false. */
+	includeState?: boolean;
+	/** Maximum UTF-8 bytes rendered for the projected result/full state. */
+	maxBytes?: number;
+}
+
 export interface GraphDefinition {
-	schemaVersion: 1;
+	schemaVersion: 2;
 	name: string;
 	description?: string;
 	entry: string | string[];
@@ -197,7 +240,9 @@ export interface GraphDefinition {
 	routes?: RouteDefinition[];
 	reducers?: Record<string, ReducerName>;
 	limits?: GraphLimits;
+	statePolicy?: GraphStatePolicy;
 	policy?: GraphPolicy;
+	result?: GraphResultPolicy;
 }
 
 export interface Diagnostic {
@@ -226,8 +271,18 @@ export interface CompiledGraph {
 
 export interface StateWrite {
 	path: string;
-	value: JsonValue;
+	value?: JsonValue;
 	nodeId: string;
+	mode?: StateWriteMode;
+}
+
+export interface ArtifactReference extends JsonObject {
+	kind: "artifact";
+	uri: string;
+	mediaType: string;
+	bytes: number;
+	sha256: string;
+	preview: string;
 }
 
 export interface NodeUsage extends UsageLedger {
@@ -306,7 +361,7 @@ export interface AgentThreadState {
 }
 
 export interface CheckpointSnapshot {
-	version: 1;
+	version: 2;
 	runId: string;
 	graphName: string;
 	graphHash: string;
@@ -326,7 +381,7 @@ export interface CheckpointSnapshot {
 	usage: UsageLedger;
 	history: NodeRunHistory[];
 	/** Durable metadata for private Pi sessions used by thread context nodes. */
-	threads?: Record<string, AgentThreadState>;
+	threads: Record<string, AgentThreadState>;
 	inFlight?: InFlightStep;
 	interrupt?: GraphInterrupt;
 	error?: string;
@@ -334,6 +389,7 @@ export interface CheckpointSnapshot {
 
 export interface CheckpointSummary {
 	runId: string;
+	revision: number;
 	graphName: string;
 	status: GraphStatus;
 	updatedAt: string;
@@ -348,6 +404,7 @@ export interface GraphRunEvent {
 		| "step_start"
 		| "node_start"
 		| "node_retry"
+		| "node_settled"
 		| "node_end"
 		| "checkpoint"
 		| "interrupt"
@@ -356,6 +413,8 @@ export interface GraphRunEvent {
 	runId: string;
 	timestamp: string;
 	step?: number;
+	/** Exact nodes selected for a step. Present on step_start events. */
+	scheduled?: string[];
 	nodeId?: string;
 	attempt?: number;
 	status?: GraphStatus | "completed" | "failed" | "interrupted";
@@ -376,7 +435,13 @@ export interface GraphRunOptions {
 export interface GraphRunResult {
 	runId: string;
 	status: GraphStatus;
+	/** Durable internal state. Tool/UI formatting must not expose it by default. */
 	state: JsonObject;
+	/** Configured user-facing result projection. */
+	result?: JsonObject;
+	stateBytes: number;
+	includeState: boolean;
+	resultMaxBytes: number;
 	usage: UsageLedger;
 	step: number;
 	nodeRuns: number;
@@ -408,13 +473,9 @@ export interface NodeExecutor {
 }
 
 export interface GraphSource {
-	name: string;
-	description?: string;
 	filePath: string;
 	scope: "user" | "project";
-	definition: GraphDefinition;
-	hash: string;
-	diagnostics: Diagnostic[];
+	compiled: CompiledGraph;
 }
 
 export interface GraphDiscoveryResult {

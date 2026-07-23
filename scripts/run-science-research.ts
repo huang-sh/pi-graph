@@ -6,15 +6,14 @@
  * that spawns actual `pi` agent subprocesses. It drives the full non-linear
  * control flow — human scope gate (auto-approved), parallel fan-out + barrier,
  * the conditional debate detour, the refinement loop, and the final report —
- * and prints every graph event plus the resulting state.
+ * and prints every graph event plus the projected result and artifact report.
  *
  * Run:  npx tsx scripts/run-science-research.ts
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
 
 import { FileCheckpointStore } from "../src/checkpoint.ts";
 import { compileGraph } from "../src/compile.ts";
@@ -28,9 +27,9 @@ import type {
 	JsonObject,
 	UsageLedger,
 } from "../src/types.ts";
-import { usageTokens } from "../src/utils.ts";
+import { getPath, isJsonObject, usageTokens } from "../src/utils.ts";
 
-const here = dirname(fileURLToPath(import.meta.url));
+const here = import.meta.dirname;
 const examplePath = join(here, "..", "examples", "science-research.json");
 const definition = JSON.parse(readFileSync(examplePath, "utf8")) as GraphDefinition;
 
@@ -91,6 +90,7 @@ async function main(): Promise<void> {
 		cwd: process.cwd(),
 		hasUI: false,
 		threadSessionsDir,
+		artifactsDir: resolve(join(workDir, "artifacts")),
 	});
 
 	const start = Date.now();
@@ -102,14 +102,15 @@ async function main(): Promise<void> {
 		console.log(`status: ${result.status}`);
 		if (result.error) console.log(`error: ${result.error}`);
 		console.log(`usage: ${fmtUsage(result.usage)}`);
-		if (result.state.report) {
-			console.log("\n--- report ---");
-			const report = typeof result.state.report === "string" ? result.state.report : JSON.stringify(result.state.report, null, 2);
-			console.log(report);
+		console.log(`state bytes: ${result.stateBytes}`);
+		if (result.result) {
+			console.log("\n--- projected result ---");
+			console.log(JSON.stringify(result.result, null, 2));
 		}
-		if (result.state.integration) {
-			console.log("\n--- integration ---");
-			console.log(JSON.stringify(result.state.integration, null, 2));
+		const report = getPath(result.state, "result.report_artifact");
+		if (isJsonObject(report) && typeof report.uri === "string") {
+			console.log("\n--- report artifact ---");
+			console.log(await readFile(report.uri, "utf8"));
 		}
 		console.log(`\nCheckpoints: ${workDir}`);
 	} finally {

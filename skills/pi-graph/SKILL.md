@@ -68,15 +68,16 @@ Hard rules (the compiler warns/violates on these):
 1. **Name** the graph and pick the `entry` node(s) (array = parallel start).
 2. **List roles.** For each `agent` node decide: context mode, `output` path, `readOnly`, model/tools/budget.
 3. **Draw control flow.** Static `edges` for always-next; `routes` for conditional branching. Mark fan-out (`to: [...]`) and barrier fan-in (`from: [...]`).
-4. **Reducers.** Any state path written by parallel nodes needs a reducer or the run fails. The `shared` `messagesPath` gets `concat` automatically.
-5. **Bounds.** Set graph-level `limits` (steps, node runs, concurrency, tokens, cost, timeout, state size) and `policy`.
-6. **Validate → run → iterate.** Don't skip validate.
+4. **Reducers and lifecycle.** Any path written by parallel nodes needs a reducer. Use `collect` for current-round fan-in, `append` only for intentional history, and `overwrite`/`unset` set assignments to clear stale working state.
+5. **State hygiene.** Keep full reports/transcripts in `response.storage: "artifact"`; keep summaries and artifact references in state. Never put the same large path in both a template and `reads`.
+6. **Bounds.** Set graph/node prompt limits, hot-state/path budgets, shared `maxStoredMessages`, result projection, ordinary execution limits, and `policy`.
+7. **Validate → run → iterate.** Don't skip validate.
 
 ### Minimal skeleton (adapt this)
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "name": "research-review",
   "entry": "researcher",
   "nodes": {
@@ -144,11 +145,27 @@ Hard rules (the compiler warns/violates on these):
 
 Condition DSL (no `eval`): `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `exists`, `truthy`, `includes`, `matches`, combinators `all` / `any` / `not`.
 
-Reducers for write conflicts: `replace`, `append`, `concat`, `merge`, `sum`, `min`, `max`. Two parallel nodes writing the same path without a reducer → run fails. A parent and child path written in the same superstep is also rejected.
+Reducers for write conflicts: `replace`, `append`, `collect`, `concat`, `merge`, `sum`, `min`, `max`. `collect` discards the previous round and keeps only the current superstep batch; use it for refinement loops. Two parallel nodes writing the same path without a reducer → run fails. A parent and child path written in the same superstep is also rejected.
+
+## State and token hygiene
+
+Use a three-tier convention:
+
+```text
+working  current-round data; unset before refinement
+memory   compact summaries retained across rounds
+result   final summary and artifact references
+```
+
+- `append` is historical accumulation; it is wrong for a fixed set of branch results across refinement rounds. Use `collect`. Treat `ACCUMULATING_REDUCER_IN_CYCLE` as a design defect unless the history is intentionally bounded elsewhere.
+- Default shared capture is `compact`, which stores a state reference rather than a duplicate body. Set `maxStoredMessages` for durable retention. Use `assistant-only` + `storeOutput: false` when the channel should be the canonical copy. Avoid `full` unless a transcript is an explicit requirement.
+- Store full Markdown/JSON/text with `response.storage: "artifact"`.
+- Use top-level `result.paths` and leave `includeState: false` so the parent Pi does not receive the entire internal state.
+- Prompt preflight fails before spawning Pi when rendered bytes exceed graph/node `maxPromptBytes`.
 
 ## Limits & policy
 
-`limits` (graph or per-node): `maxSteps`, `maxNodeRuns`, `maxConcurrency`, `maxTokens`, `maxCostUsd`, `timeoutMs`, `maxTurns`, `maxStateBytes`, `maxOutputBytes`.
+`limits` (graph or per-node): `maxSteps`, `maxNodeRuns`, `maxConcurrency`, `maxTokens`, `maxCostUsd`, `timeoutMs`, `maxTurns`, `maxStateBytes`, `maxPromptBytes`. Use `response.maxBytes` for agent output and `statePolicy.paths` for exact-path byte budgets.
 
 `policy`:
 
@@ -163,14 +180,14 @@ Reducers for write conflicts: `replace`, `append`, `concat`, `merge`, `sum`, `mi
 /pi-graph validate research-review        # always validate first
 /pi-graph run research-review <task text or JSON object>
 /pi-graph resume <runId> <value or JSON>  # after a human interrupt
-/pi-graph inspect [runId]                 # checkpoint / recent runs
+/pi-graph inspect [runId] [--inventory|--full|state.path]
 ```
 
 Or via tools (the model calls these; the three tools are disabled inside child Pi to prevent hidden recursion):
 
 - `pi_graph_run` — `{ graph, task, checkpoint }`; input lands at `state.input`.
 - `pi_graph_resume` — `{ runId, value | valueJson }` to satisfy a human node.
-- `pi_graph_inspect` — checkpoint, thread metadata, or recent runs.
+- `pi_graph_inspect` — summary-first checkpoint inspection, state inventory/path views, or explicit full records.
 
 Checkpoints live at `~/.pi/agent/pi-graph/runs/<runId>.json`. Recovery re-runs only unresolved nodes. Resuming after the graph **definition** changed is refused by default; set `forceGraphVersion: true` only after checking state compatibility and side-effect idempotency.
 
@@ -204,7 +221,10 @@ Renders the graph as a Mermaid `flowchart LR` in the TUI. Shapes: `agent` → st
 
 ## Inspect & debug
 
-- `/pi-graph inspect <runId>` — full checkpoint JSON (state, routing, `inFlight`, usage).
+- `/pi-graph inspect <runId>` — compact status, usage, pending work, state bytes, and largest paths.
+- `/pi-graph inspect <runId> --inventory` — state path/type/size inventory.
+- `/pi-graph inspect <runId> working.reviewed_evidence` — one state path.
+- `/pi-graph inspect <runId> --full` — complete checkpoint, explicitly requested and byte capped.
 - Stuck after a definition edit? You hit the graph-hash guard — review state compatibility, then `forceGraphVersion`.
 - `thread` run won't resume? The private session file may be missing — recovery fails closed by design.
 - Cost/token overshoot near limits is expected; limits rely on provider usage events and a single in-flight response can slightly exceed before termination.
@@ -215,4 +235,4 @@ Renders the graph as a Mermaid `flowchart LR` in the TUI. Shapes: `agent` → st
 - `thread` continuity is real, but the graph checkpoint and the Pi JSONL session are **two** persistence objects; back up / migrate both.
 - Checkpoints are **at-least-once**; external side effects are not guaranteed exactly-once.
 - `readOnly` is a tool allowlist, **not** an OS sandbox. For high-risk execution use a container.
-- Graph format is `schemaVersion: 1`.
+- Graph format is `schemaVersion: 2`; other schema versions are rejected.

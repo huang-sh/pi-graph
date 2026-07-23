@@ -53,19 +53,19 @@ Pi session
 
 GraphEngine 不直接调用 provider SDK。Agent node 委托给 Pi CLI，复用 Pi 的 provider、模型、tool harness、context files、session format 和 NDJSON usage protocol。
 
-## 三个记忆平面
+## 四个记忆平面
 
-### 1. Graph state
+### 1. Graph state（hot working set）
 
 ```text
 state.input
-plan
-implementation
-review
+working.*
+memory.*
+result.*
 conversation.messages
 ```
 
-它是 JSON serializable、checkpointed、受 reducer 和 state-size limit 约束的显式记忆。条件 route 只读取 graph state。
+它是 JSON serializable、checkpointed、受 reducer、state policy 和 state-size limit 约束的显式记忆。条件 route 只读取 graph state。Graph state 不是全文仓库：`working` 应按轮次清理，`memory` 只保留压缩摘要，`result` 保存小型输出和 artifact 引用。
 
 ### 2. Thread private session
 
@@ -78,6 +78,10 @@ threadKey → stable sessionId → Pi JSONL
 ### 3. Workspace / context files
 
 代码、数据、报告、`AGENTS.md` 等由工作目录和 Pi resource loader 提供。它们是外部真实世界状态，不由 graph checkpoint 回滚。
+
+### 4. Runtime artifacts
+
+Agent output 可声明 `response.storage: "artifact"`。PiNodeExecutor 将完整正文写入私有、content-addressed 文件，Graph state 仅保存 URI、media type、bytes、SHA-256 和有限 preview。完整 report、branch analysis 和 debate transcript 应进入该冷存储，而不是热 state。
 
 ## Context execution
 
@@ -118,28 +122,25 @@ Thread session 和 graph checkpoint 不构成跨文件事务。若 Pi 已追加 
 
 ```text
 state[messagesPath] snapshot
-  → select recent messages
-  → role-tagged transcript projection
+  → select only recent maxMessages
+  → resolve compact state references unless already projected
+  → byte-bounded role-tagged transcript
   → pi --no-session
-  → collect user/assistant/tool messages
-  → one state write to messagesPath
+  → capture according to policy
+  → commit + optional maxStoredMessages pruning
 ```
 
-Shared mode 不复用 Pi session。它把成功 node 的可公开对话记录变成普通 graph messages：
+Shared mode 不复用 Pi session。默认 `capture: compact` 不保存展开后的完整 user prompt；它保存一条小型 assistant message，并用 `statePath` 引用 node output 作为 canonical content。若当前 node 已经通过 template 或 `reads` 投影该路径，runtime 不再次展开引用。
 
-```json
-{
-  "role": "assistant",
-  "content": "...",
-  "nodeId": "writer",
-  "name": null,
-  "createdAt": "..."
-}
-```
+`assistant-only` 保存最终 assistant 文本，通常与 `storeOutput: false` 配合；`none` 不写 channel；`full` 才保存完整 user/tool/assistant transcript，并产生 warning。
 
-`messagesPath` 使用隐式 `concat` reducer。并行节点都读取同一个 transcript snapshot，分别生成 message arrays，commit 时按 scheduled order 合并。
+`messagesPath` 使用隐式 `concat` reducer。并行节点都读取同一个 transcript snapshot，commit 时按 scheduled order 合并。`maxMessages` / `maxPromptBytes` 限制一次模型输入；`maxStoredMessages` 在 commit 后真正裁剪 durable state。旧 compact reference 已被 state cleanup 删除时仅显示 unavailable marker，不阻塞后续运行。
 
-`maxMessages` 和 `maxPromptBytes` 只限制每次 prompt projection，不删除 checkpoint 中已有 messages。长期图需要通过显式 set/compaction node 管理 channel 大小，或依赖 graph `maxStateBytes` 停止。
+## Prompt projection 与 preflight
+
+Graph state 不会整体自动发送给模型。PiNodeExecutor 只组合：node template、shared transcript、`reads` projection、response contract 和 node system prompt。Compiler 对 template 与 `reads` 的重叠给出诊断；runtime 对精确重复路径以及 compact shared state reference 再次去重。
+
+`pi-graph` 构造的 prompt 部分在 spawn 前计算 UTF-8 bytes，并与 node/graph `maxPromptBytes` 的较小值比较。超限时返回 `PROMPT_BUDGET_EXCEEDED`，不会发起该次模型调用。该 preflight 不包含 Pi 基础 system prompt、工具 schema、自动加载的 context/skill/extension、provider framing，或 thread session 已有私有历史；这些由实际 usage、Pi context management 和更保守的运行预算兜底。Runtime 只维护这一套 prompt byte 判断。
 
 ## Superstep 模型
 
@@ -150,34 +151,48 @@ Shared mode 不复用 Pi session。它把成功 node 的可公开对话记录变
 3. 保存 `inFlight` checkpoint。
 4. 所有节点读取同一个 state snapshot。
 5. 在 `maxConcurrency` 内并发运行 unresolved nodes。
-6. 每个成功结果立即保存到 `inFlight.completed`，但不修改 shared state。
-7. 所有节点解决后按 scheduled order 聚合 writes。
-8. 应用 effective reducers 并原子提交新 state。
-9. 增加 completion counts。
-10. 计算 routes/static edges/barriers，写入下一 step 的 `pending`。
+6. 每个节点真实结束时立即发出只用于观测的 `node_settled`；它不代表 state 已提交。
+7. 并行 batch 返回后，按 scheduled order 发出 `node_end`，并将成功结果逐个保存到 `inFlight.completed`，但不修改 shared state。
+8. 所有节点解决后按 scheduled order 聚合 writes。
+9. 应用 effective reducers 并原子提交新 state。
+10. 增加 completion counts。
+11. 计算 routes/static edges/barriers，写入下一 step 的 `pending`。
 
 这种 bulk-synchronous 模型避免较快并行节点提前改变 sibling 正在读取的 state。
 
-## State commit
+## 运行时可观测性
+
+Extension 为每次 run/resume 建立一个仅含控制面信息的 `RuntimeGraphMonitor`。它从 graph definition 提取静态边、条件路由和错误 fallback，从 `step_start.scheduled`、node start/retry/settled/end、interrupt 与 graph end events 归约出当前节点状态。Resume 时先用 checkpoint history、pending 和 `inFlight` hydrate，再继续消费新事件。
+
+同一份有界快照同时驱动编辑器下方的 TUI widget 和 streaming tool result。默认最多 10 行，并优先保留活动、重试、失败和排队节点，避免大型图撑满终端。Widget 是临时 UI，所有退出路径都会清理；checkpoint 和 `node_end` 仍是 durable/control-flow 事实，`node_settled` 只解决并发 batch 中“较快节点已经结束，但尚未进入 ordered reconciliation”的显示延迟。
+
+## State commit 与生命周期
 
 节点返回：
 
 ```ts
 interface StateWrite {
   path: string;
-  value: JsonValue;
+  value?: JsonValue;
   nodeId: string;
+  mode?: "reduce" | "overwrite" | "unset";
 }
 ```
 
-同一路径：
+- `reduce`：使用 channel reducer；单 writer 无 reducer时等价 replace。
+- `overwrite`：绕过 reducer，适合在新轮次建立干净 working set。
+- `unset`：真正删除旧路径，不留下 `null` 占位。
+- `append`：跨 superstep 累积历史。
+- `collect`：只收集当前 superstep 的并行 writes，替换上一轮 batch。
+- shared messages：隐式 concat，随后按 `maxStoredMessages` 裁剪。
 
-- 单 writer：隐式 replace
-- 多 writer、无 reducer：fail
-- 多 writer、有 reducer：按 scheduled order deterministic reduce
-- shared messages path：隐式 concat
+Compiler 对 cyclic node 写入 `append`/`concat` channel 发出 `ACCUMULATING_REDUCER_IN_CYCLE`，除非它是配置了 `maxStoredMessages` 的有界 shared channel。父子路径并行写入、同一路径中的显式 overwrite/unset 与其他 writes 混用都会失败。Commit 后立即执行 shared retention、hot-state/per-path budget，再计算 route。
 
-父子路径并行写入也会失败。State commit 前后保持 JSON serializable，并进行 deep clone。
+## User-facing result 与 inspect
+
+`GraphRunResult.state` 仍是内部 durable state，但 extension 默认只渲染顶层 `result.paths` 投影；`includeState` 默认为 false。这样 100KB 内部 state 不会在 tool result 中再次进入主 Pi context。
+
+Inspect 默认输出 checkpoint summary、pending/in-flight、usage、state 总大小和最大 paths；inventory/path/full 是显式视图。只有 full 会序列化完整 checkpoint，且仍有 byte cap。
 
 ## Routing 与 barrier
 
@@ -185,14 +200,51 @@ Route 在整个 step writes 提交后求值，因此 reviewer route 可以读取
 
 `onError.route` 是 node-result override：失败节点走专用 destination，不再执行正常 route/edge。
 
+合法的业务拒绝仍是成功 node result；`maxSteps` 等 graph-level hard limit 也不会进入 node `onError`。需要降级输出的循环在 graph state 中显式计数，并在硬限制前路由到 terminal fallback，不能依赖撞限后再执行节点。
+
 Multi-source edge 使用 completion count barrier：当每个 source count 都大于该 barrier 已消费 count 时触发一次。这支持循环中的重复 fan-in。
 
 ## Checkpoint
 
-Checkpoint 使用临时文件 + atomic rename，并设置目录 `0700`、文件 `0600`。
+File checkpoint adapter 不使用需要回收的锁文件。每个 run 在 `.journal/<runId>/` 下维护 append-only 的不可变操作序列；lease acquire/renew、CAS commit、release 和 delete 都尝试用 atomic hard-link 发布唯一的下一序号文件。多个进程从同一序号出发时只有一个 link 能成功，其余进程重新读取 winner 后重试或返回 lease/revision 冲突，因此 stale owner 无法删除或覆盖新 owner 的协调状态。
+
+Checkpoint snapshot 先写入并 `fsync` 为唯一命名的 immutable blob，journal entry 的 inode 也在 hard-link 发布前完成 `fsync`。需要对调用者确认成功的 durable 状态转换还会同步最终 journal 文件及其目录；首次创建目录时也会同步父目录。这样，即使一次非 durable lease 目录更新被稍后的目录同步一并刷盘，它也不会成为内容撕裂的最高序号。只有 journal 是 lease、revision 和 checkpoint pointer 的权威来源；根目录 `<runId>.json` 是供人工检查与备份的 best-effort 最新镜像，镜像失败不会反转已经成功的 CAS。耐久同步失败会作为 checkpoint control error 返回，不能被误报成一次成功 commit。
+
+Journal sequence claim 永不删除或复用。保留 append-only CAS namespace 可以避免暂停进程在恢复后复用旧序号产生 ABA；代价是长运行 run 的 lease entry 与旧 checkpoint blob 会持续增长。删除 run 会清除 blob，但为了防止复活仍保留 sequence claim 和最小 tombstone，因此部署方仍需监控 inode，并在确认不存在 stale 进程且不再复用这些 `runId` 时按运维策略轮换或归档整个 checkpoint root。目录使用 `0700`，文件使用 `0600`。完整耐久语义要求同一主机、支持原子 hard-link 和目录 `fsync` 的本地文件系统，不是跨主机分布式协调协议；不支持目录同步的平台只能提供 best-effort metadata durability。
+
+删除 run 时先发布不可变 tombstone，再移除 snapshot blobs 和根目录镜像；最小 tombstone 会保留，以阻止 stale owner 或残留旧镜像复活已经删除的 `runId`。
+
+磁盘格式是带 revision 的 envelope：
+
+```ts
+interface CheckpointRecord {
+  format: "pi-graph-checkpoint";
+  formatVersion: 2;
+  revision: number;
+  snapshot: CheckpointSnapshot;
+}
+```
+
+新 run 在 `open({ mode: "create" })` 返回前已持久化为 revision 1。Checkpoint 只接受 `formatVersion: 2` envelope；其他磁盘格式直接拒绝，不执行隐式迁移。
+
+`CheckpointStore.open()` 在加载 resume state 或运行新节点前取得 run lease。`CheckpointRun` 在内部 heartbeat；lease 不确定或丢失时 abort 自己的 signal。`commit()` 同时验证 owner、expiry 和 expected revision，成功后 revision 精确加一。CAS/lease/schema 错误不会被 engine 转写成一个新的 failed checkpoint。
+
+```ts
+interface CheckpointRun {
+  readonly runId: string;
+  readonly revision: number;
+  readonly snapshot: CheckpointSnapshot;
+  readonly signal: AbortSignal;
+  commit(snapshot: CheckpointSnapshot): Promise<void>;
+  close(): Promise<void>;
+}
+```
+
+加载、创建和每次 commit 共用同一个 strict validator。除开放的 JSON state/value 外，所有 control objects 都拒绝未知字段；validator 覆盖 usage、history、threads、in-flight success results、writes、interrupt、UUID session IDs、有限非负整数、规范时间戳、plain JSON object 以及 status-specific invariants。Snapshot 必须显式包含 `threads`。`running` 不得携带 interrupt/error/end，`interrupted` 必须指向 unresolved in-flight node，terminal 状态必须满足各自的 end/error 约束。
 
 ```ts
 interface CheckpointSnapshot {
+  version: 2;
   runId: string;
   graphName: string;
   graphHash: string;
@@ -203,7 +255,7 @@ interface CheckpointSnapshot {
   barrierConsumed: Record<string, Record<string, number>>;
   usage: UsageLedger;
   history: NodeRunHistory[];
-  threads?: Record<string, AgentThreadState>;
+  threads: Record<string, AgentThreadState>;
   inFlight?: {
     step: number;
     scheduled: string[];
@@ -230,13 +282,15 @@ interface AgentThreadState {
 
 ### Crash recovery
 
-并行 step 运行 A、B、C：
+并行 step 运行 A、B、C。整个 batch 返回后：
 
 - A 成功并 checkpoint
 - B 成功并 checkpoint
-- C 运行时退出
+- C 返回失败并保留在 unresolved
 
 恢复后只执行 C；随后 A/B/C writes 一起 commit。
+
+如果进程在整个 batch 返回前退出，A/B 即使已在进程内完成也还没有进入 `inFlight.completed`，恢复时仍会重跑。未过期 lease 会阻止第二个执行者进入同一 run；但旧进程暂停超过 TTL 后，新 owner 可以接管，旧进程恢复时仍可能在下一次 heartbeat 或 commit 发现失租前短暂继续执行。Lease/CAS 只 fence checkpoint 协调状态，不能把外部副作用变成 exactly-once；node 仍应幂等，或使用下游 idempotency key/fencing token。
 
 Shared messages 属于 pending writes，所以 A/B 的 messages 已保存在 `inFlight.completed` 但尚未进入 state。Thread private session 由 Pi 直接追加，可能领先于 graph checkpoint。
 

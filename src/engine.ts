@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
-import type { CheckpointStore } from "./checkpoint.ts";
+import { setTimeout as delay } from "node:timers/promises";
+import {
+	CheckpointConflictError,
+	CheckpointDurabilityError,
+	CheckpointLeaseError,
+	CheckpointValidationError,
+	type CheckpointRun,
+	type CheckpointStore,
+} from "./checkpoint.ts";
 import { evaluateCondition } from "./condition.ts";
 import type {
 	AgentNodeDefinition,
@@ -7,13 +15,13 @@ import type {
 	CheckpointSnapshot,
 	CompiledGraph,
 	ExecutionBudget,
+	GraphDefinition,
 	GraphLimits,
 	GraphRunEvent,
 	GraphRunOptions,
 	GraphRunResult,
 	InFlightStep,
 	JsonObject,
-	JsonValue,
 	NodeDefinition,
 	NodeExecutionContext,
 	NodeExecutionFailure,
@@ -35,13 +43,22 @@ import {
 	deepMergeObjects,
 	emptyUsage,
 	errorMessage,
-	sleep,
+	getPath,
+	isJsonObject,
+	setPath,
 	stateSizeBytes,
 	uniqueStrings,
 	usageTokens,
 } from "./utils.ts";
 
-const DEFAULT_LIMITS: Required<GraphLimits> = {
+type ResolvedGraphLimits = Required<
+	Pick<
+		GraphLimits,
+		"maxSteps" | "maxNodeRuns" | "maxConcurrency" | "maxCostUsd" | "maxTokens" | "timeoutMs" | "maxStateBytes" | "maxPromptBytes"
+	>
+>;
+
+const DEFAULT_LIMITS: ResolvedGraphLimits = {
 	maxSteps: 32,
 	maxNodeRuns: 128,
 	maxConcurrency: 4,
@@ -49,6 +66,7 @@ const DEFAULT_LIMITS: Required<GraphLimits> = {
 	maxTokens: 1_000_000,
 	timeoutMs: 30 * 60 * 1000,
 	maxStateBytes: 2 * 1024 * 1024,
+	maxPromptBytes: 256 * 1024,
 };
 
 export interface GraphEngineConfig {
@@ -88,110 +106,135 @@ export class GraphEngine {
 
 	async run(options: GraphRunOptions = {}): Promise<GraphRunResult> {
 		const limits = resolveLimits(this.graph.definition.limits);
-		const checkpointEnabled = (options.checkpoint ?? true) && this.checkpointStore !== undefined;
+		const checkpointRequested = options.checkpoint ?? true;
+		if (options.runId && !checkpointRequested) throw new Error("Cannot resume with checkpoint: false");
+		const checkpointEnabled = checkpointRequested && this.checkpointStore !== undefined;
 		const invocationStartedAt = Date.now();
 		let baseActiveTimeMs = 0;
-		let snapshot: CheckpointSnapshot;
-
-		if (options.runId) {
-			if (!this.checkpointStore) throw new Error("Cannot resume without a checkpoint store");
-			snapshot = await this.checkpointStore.load(options.runId);
-			baseActiveTimeMs = snapshot.activeTimeMs ?? 0;
-			this.assertCheckpointGraph(snapshot, options.forceGraphVersion ?? false);
-			snapshot.threads ??= {};
-			if (snapshot.status === "completed") return resultFromSnapshot(snapshot);
-			if (snapshot.interrupt && options.resumeValue === undefined) return resultFromSnapshot(snapshot);
-			snapshot.status = "running";
-			snapshot.error = undefined;
-			snapshot.endedAt = undefined;
-			snapshot.updatedAt = nowIso();
-		} else {
-			snapshot = this.createSnapshot(options.input ?? {});
-		}
-
-		const budget = new GraphBudget(snapshot.usage, limits);
-
+		let checkpointRun: CheckpointRun | undefined;
+		let resumeInterruptNodeId: string | undefined;
 		try {
-			const initialStateBytes = stateSizeBytes(snapshot.state);
-			if (initialStateBytes > limits.maxStateBytes) {
-				throw new GraphLimitError(
-					"MAX_STATE_BYTES",
-					`Graph state is ${initialStateBytes} bytes; maxStateBytes is ${limits.maxStateBytes}`,
-				);
-			}
-			await this.emit(options, {
-				type: "graph_start",
-				runId: snapshot.runId,
-				timestamp: nowIso(),
-				step: snapshot.step,
-				status: "running",
-				usage: copyUsage(snapshot.usage),
-			});
-			await this.save(snapshot, checkpointEnabled, options, baseActiveTimeMs, invocationStartedAt);
-
-			while (true) {
-				this.assertRunActive(snapshot, options.signal, limits, baseActiveTimeMs, invocationStartedAt);
-				budget.assertGraphWithinLimits();
-
-				if (!snapshot.inFlight) {
-					const scheduled = uniqueStrings(snapshot.pending.filter((nodeId) => nodeId !== END));
-					if (scheduled.length === 0) {
-						return await this.finish(snapshot, "completed", undefined, checkpointEnabled, options, baseActiveTimeMs, invocationStartedAt);
-					}
-					if (snapshot.step >= limits.maxSteps) {
-						throw new GraphLimitError("MAX_STEPS", `Graph exceeded maxSteps (${limits.maxSteps})`);
-					}
-					snapshot.step += 1;
-					snapshot.pending = [];
-					snapshot.inFlight = {
-						step: snapshot.step,
-						scheduled,
-						unresolved: [...scheduled],
-						completed: {},
-					};
-					this.prepareThreadStates(snapshot, scheduled);
-					await this.emit(options, {
-						type: "step_start",
-						runId: snapshot.runId,
-						timestamp: nowIso(),
-						step: snapshot.step,
-						message: scheduled.join(", "),
-					});
-					await this.save(snapshot, checkpointEnabled, options, baseActiveTimeMs, invocationStartedAt);
+			let snapshot: CheckpointSnapshot;
+			if (options.runId) {
+				if (!this.checkpointStore) throw new Error("Cannot resume without a checkpoint store");
+				checkpointRun = await this.checkpointStore.open({ mode: "resume", runId: options.runId });
+				snapshot = checkpointRun.snapshot;
+				baseActiveTimeMs = snapshot.activeTimeMs;
+				this.assertCheckpointGraph(snapshot, options.forceGraphVersion ?? false);
+				if (snapshot.status === "completed") return resultFromSnapshot(snapshot, this.graph.definition);
+				if (snapshot.interrupt && options.resumeValue === undefined) return resultFromSnapshot(snapshot, this.graph.definition);
+				resumeInterruptNodeId = snapshot.interrupt?.nodeId;
+				snapshot.interrupt = undefined;
+				snapshot.status = "running";
+				snapshot.error = undefined;
+				snapshot.endedAt = undefined;
+				snapshot.updatedAt = nowIso();
+			} else {
+				snapshot = this.createSnapshot(options.input ?? {});
+				if (checkpointEnabled && this.checkpointStore) {
+					checkpointRun = await this.checkpointStore.open({ mode: "create", snapshot });
 				}
+			}
 
-				const stepResult = await this.executeInFlight(
+			const runOptions = checkpointRun
+				? { ...options, signal: options.signal ? AbortSignal.any([options.signal, checkpointRun.signal]) : checkpointRun.signal }
+				: options;
+			const budget = new GraphBudget(snapshot.usage, limits);
+
+			try {
+				this.assertStateWithinPolicy(snapshot.state, limits);
+				await this.emit(runOptions, {
+					type: "graph_start",
+					runId: snapshot.runId,
+					timestamp: nowIso(),
+					step: snapshot.step,
+					status: "running",
+					usage: copyUsage(snapshot.usage),
+				});
+				await this.save(snapshot, checkpointRun, runOptions, baseActiveTimeMs, invocationStartedAt);
+
+				while (true) {
+					this.assertRunActive(snapshot, runOptions.signal, limits, baseActiveTimeMs, invocationStartedAt);
+					budget.assertGraphWithinLimits();
+
+					if (!snapshot.inFlight) {
+						const scheduled = uniqueStrings(snapshot.pending.filter((nodeId) => nodeId !== END));
+						if (scheduled.length === 0) {
+							return await this.finish(
+								snapshot,
+								"completed",
+								undefined,
+								checkpointRun,
+								runOptions,
+								baseActiveTimeMs,
+								invocationStartedAt,
+							);
+						}
+						if (snapshot.step >= limits.maxSteps) {
+							throw new GraphLimitError("MAX_STEPS", `Graph exceeded maxSteps (${limits.maxSteps})`);
+						}
+						snapshot.step += 1;
+						snapshot.pending = [];
+						snapshot.inFlight = {
+							step: snapshot.step,
+							scheduled,
+							unresolved: [...scheduled],
+							completed: {},
+						};
+						this.prepareThreadStates(snapshot, scheduled);
+						await this.emit(runOptions, {
+							type: "step_start",
+							runId: snapshot.runId,
+							timestamp: nowIso(),
+							step: snapshot.step,
+							scheduled: [...scheduled],
+							message: scheduled.join(", "),
+						});
+						await this.save(snapshot, checkpointRun, runOptions, baseActiveTimeMs, invocationStartedAt);
+					}
+
+					const stepResult = await this.executeInFlight(
+						snapshot,
+						resumeInterruptNodeId,
+						budget,
+						limits,
+						runOptions,
+						checkpointRun,
+						baseActiveTimeMs,
+						invocationStartedAt,
+					);
+					resumeInterruptNodeId = undefined;
+					if (stepResult) return stepResult;
+				}
+			} catch (error) {
+				if (isCheckpointControlError(error)) throw error;
+				if (checkpointRun?.signal.aborted) {
+					throw checkpointRun.signal.reason ?? new CheckpointLeaseError("RUN_LEASE_LOST", `Lease for ${snapshot.runId} was lost`);
+				}
+				const status = runOptions.signal?.aborted ? "cancelled" : "failed";
+				return await this.finish(
 					snapshot,
-					budget,
-					limits,
-					options,
-					checkpointEnabled,
+					status,
+					errorMessage(error),
+					checkpointRun,
+					runOptions,
 					baseActiveTimeMs,
 					invocationStartedAt,
+					false,
 				);
-				if (stepResult) return stepResult;
 			}
-		} catch (error) {
-			const status = options.signal?.aborted ? "cancelled" : "failed";
-			return await this.finish(
-				snapshot,
-				status,
-				errorMessage(error),
-				checkpointEnabled,
-				options,
-				baseActiveTimeMs,
-				invocationStartedAt,
-				false,
-			);
+		} finally {
+			await closeCheckpointRun(checkpointRun);
 		}
 	}
 
 	private async executeInFlight(
 		snapshot: CheckpointSnapshot,
+		resumeInterruptNodeId: string | undefined,
 		budget: GraphBudget,
-		limits: Required<GraphLimits>,
+		limits: ResolvedGraphLimits,
 		options: GraphRunOptions,
-		checkpointEnabled: boolean,
+		checkpointRun: CheckpointRun | undefined,
 		baseActiveTimeMs: number,
 		invocationStartedAt: number,
 	): Promise<GraphRunResult | undefined> {
@@ -200,25 +243,54 @@ export class GraphEngine {
 		const threadsChanged = this.prepareThreadStates(snapshot, inFlight.scheduled);
 		this.assertNoConcurrentThreadContexts(inFlight.scheduled);
 		if (threadsChanged) {
-			await this.save(snapshot, checkpointEnabled, options, baseActiveTimeMs, invocationStartedAt);
+			await this.save(snapshot, checkpointRun, options, baseActiveTimeMs, invocationStartedAt);
 		}
 		const unresolved = [...inFlight.unresolved];
 		const results = await mapWithConcurrencyLimit(unresolved, limits.maxConcurrency, async (nodeId) => {
 			const node = this.graph.definition.nodes[nodeId];
-			if (!node) {
-				return failureResult(`Unknown scheduled node ${nodeId}`, "UNKNOWN_NODE", false, 1, nowIso(), nowIso());
-			}
-			return await this.executeNodeWithRetry(
-				snapshot,
+			const result = node
+				? await this.executeNodeWithRetry(
+						snapshot,
+						nodeId,
+						node,
+						resumeInterruptNodeId,
+						budget,
+						limits,
+						options,
+						baseActiveTimeMs,
+						invocationStartedAt,
+					)
+				: failureResult(`Unknown scheduled node ${nodeId}`, "UNKNOWN_NODE", false, 1, nowIso(), nowIso());
+			await this.emit(options, {
+				type: "node_settled",
+				runId: snapshot.runId,
+				timestamp: nowIso(),
+				step: snapshot.step,
 				nodeId,
-				node,
-				budget,
-				limits,
-				options,
-				baseActiveTimeMs,
-				invocationStartedAt,
-			);
+				attempt: result.attempts,
+				status:
+					options.signal?.aborted
+						? "cancelled"
+						: result.kind === "success"
+							? "completed"
+							: result.kind === "interrupt"
+								? "interrupted"
+								: "failed",
+				message:
+					result.kind === "failure"
+						? result.error
+						: result.kind === "interrupt"
+							? result.interrupt.prompt
+							: undefined,
+				usage: copyUsage(budget.usage),
+			});
+			return result;
 		});
+		// Some executors report an abort as a normal failure result. Re-check the
+		// run signal before classifying node results so external cancellation is
+		// persisted as `cancelled`, while a lost checkpoint lease is still
+		// propagated by the outer control-error boundary.
+		this.assertRunActive(snapshot, options.signal, limits, baseActiveTimeMs, invocationStartedAt);
 
 		const fatalFailures: Array<{ nodeId: string; failure: NodeExecutionFailure }> = [];
 		const interrupts: Array<{ nodeId: string; result: Extract<NodeExecutionResult, { kind: "interrupt" }> }> = [];
@@ -265,7 +337,7 @@ export class GraphEngine {
 					message: resolution.historyError,
 					usage: copyUsage(snapshot.usage),
 				});
-				await this.save(snapshot, checkpointEnabled, options, baseActiveTimeMs, invocationStartedAt);
+				await this.save(snapshot, checkpointRun, options, baseActiveTimeMs, invocationStartedAt);
 			} else if (resolution.fatal) {
 				fatalFailures.push({ nodeId, failure: resolution.fatal });
 				this.appendHistory(snapshot, nodeId, resolution.fatal, "failed", resolution.fatal.error);
@@ -290,7 +362,7 @@ export class GraphEngine {
 				snapshot,
 				"failed",
 				error,
-				checkpointEnabled,
+				checkpointRun,
 				options,
 				baseActiveTimeMs,
 				invocationStartedAt,
@@ -316,7 +388,7 @@ export class GraphEngine {
 				status: "interrupted",
 				message: first.result.interrupt.prompt,
 			});
-			await this.save(snapshot, checkpointEnabled, options, baseActiveTimeMs, invocationStartedAt);
+			await this.save(snapshot, checkpointRun, options, baseActiveTimeMs, invocationStartedAt);
 			await this.emit(options, {
 				type: "graph_end",
 				runId: snapshot.runId,
@@ -325,7 +397,7 @@ export class GraphEngine {
 				status: "interrupted",
 				usage: copyUsage(snapshot.usage),
 			});
-			return resultFromSnapshot(snapshot);
+			return resultFromSnapshot(snapshot, this.graph.definition);
 		}
 
 		await this.commitStep(snapshot, inFlight, limits);
@@ -337,7 +409,7 @@ export class GraphEngine {
 			status: "completed",
 			usage: copyUsage(snapshot.usage),
 		});
-		await this.save(snapshot, checkpointEnabled, options, baseActiveTimeMs, invocationStartedAt);
+		await this.save(snapshot, checkpointRun, options, baseActiveTimeMs, invocationStartedAt);
 		return undefined;
 	}
 
@@ -345,8 +417,9 @@ export class GraphEngine {
 		snapshot: CheckpointSnapshot,
 		nodeId: string,
 		node: NodeDefinition,
+		resumeInterruptNodeId: string | undefined,
 		budget: GraphBudget,
-		limits: Required<GraphLimits>,
+		limits: ResolvedGraphLimits,
 		options: GraphRunOptions,
 		baseActiveTimeMs: number,
 		invocationStartedAt: number,
@@ -354,7 +427,7 @@ export class GraphEngine {
 		const maxAttempts = Math.max(1, node.retry?.maxAttempts ?? 1);
 		const initialBackoff = Math.max(0, node.retry?.backoffMs ?? 0);
 		const multiplier = Math.max(1, node.retry?.backoffMultiplier ?? 2);
-		const aggregate = emptyNodeUsage();
+		const aggregate: NodeUsage = emptyUsage();
 		const startedAt = nowIso();
 		let lastFailure: NodeExecutionFailure | undefined;
 
@@ -393,7 +466,7 @@ export class GraphEngine {
 					state: deepCloneJson(snapshot.state),
 					graph: this.graph,
 					thread: this.threadForNode(snapshot, nodeId, node),
-					resumeValue: snapshot.interrupt?.nodeId === nodeId ? options.resumeValue : undefined,
+					resumeValue: resumeInterruptNodeId === nodeId ? options.resumeValue : undefined,
 					signal: timeoutController.signal,
 					budget: scopedBudget,
 					onEvent: options.onEvent,
@@ -456,13 +529,13 @@ export class GraphEngine {
 				attempt: attempt + 1,
 				message: lastFailure.error,
 			});
-			await sleep(backoff, options.signal);
+			if (backoff > 0) await delay(backoff, undefined, { signal: options.signal });
 		}
 
 		return lastFailure ?? failureResult("Node failed without a result", "UNKNOWN", false, maxAttempts, startedAt, nowIso(), aggregate);
 	}
 
-	private async commitStep(snapshot: CheckpointSnapshot, inFlight: InFlightStep, limits: Required<GraphLimits>): Promise<void> {
+	private async commitStep(snapshot: CheckpointSnapshot, inFlight: InFlightStep, limits: ResolvedGraphLimits): Promise<void> {
 		const orderedResults = inFlight.scheduled.map((nodeId) => {
 			const result = inFlight.completed[nodeId];
 			if (!result) throw new Error(`Step ${inFlight.step} is missing result for ${nodeId}`);
@@ -470,10 +543,8 @@ export class GraphEngine {
 		});
 		const writes: StateWrite[] = orderedResults.flatMap((item) => item.result.writes);
 		snapshot.state = applyStateWrites(snapshot.state, writes, this.graph.reducers);
-		const stateBytes = stateSizeBytes(snapshot.state);
-		if (stateBytes > limits.maxStateBytes) {
-			throw new GraphLimitError("MAX_STATE_BYTES", `Graph state is ${stateBytes} bytes; maxStateBytes is ${limits.maxStateBytes}`);
-		}
+		this.pruneSharedMessageChannels(snapshot.state);
+		this.assertStateWithinPolicy(snapshot.state, limits);
 
 		for (const nodeId of inFlight.scheduled) snapshot.completionCounts[nodeId] = (snapshot.completionCounts[nodeId] ?? 0) + 1;
 		const next: string[] = [];
@@ -508,6 +579,50 @@ export class GraphEngine {
 		snapshot.status = "running";
 		snapshot.error = undefined;
 		snapshot.updatedAt = nowIso();
+	}
+
+	private pruneSharedMessageChannels(state: JsonObject): void {
+		const limits = new Map<string, number>();
+		for (const node of Object.values(this.graph.definition.nodes)) {
+			if (node.type !== "agent" || (node.context?.mode ?? "isolated") !== "shared") continue;
+			if ((node.context?.capture ?? "compact") === "none") continue;
+			const maxStoredMessages = node.context?.maxStoredMessages;
+			if (maxStoredMessages === undefined) continue;
+			const path = node.context?.messagesPath ?? "messages";
+			const current = limits.get(path);
+			limits.set(path, current === undefined ? maxStoredMessages : Math.min(current, maxStoredMessages));
+		}
+
+		for (const [path, maxStoredMessages] of limits) {
+			const value = getPath(state, path);
+			if (value === undefined) continue;
+			if (!Array.isArray(value)) {
+				throw new GraphLimitError("SHARED_CONTEXT_INVALID", `Shared messages state at ${path} must be an array`);
+			}
+			if (value.length > maxStoredMessages) {
+				setPath(state, path, deepCloneJson(value.slice(-maxStoredMessages)));
+			}
+		}
+	}
+
+	private assertStateWithinPolicy(state: JsonObject, limits: ResolvedGraphLimits): void {
+		const stateBytes = stateSizeBytes(state);
+		if (stateBytes > limits.maxStateBytes) {
+			throw new GraphLimitError("MAX_STATE_BYTES", `Graph state is ${stateBytes} bytes; maxStateBytes is ${limits.maxStateBytes}`);
+		}
+		const policy = this.graph.definition.statePolicy;
+		for (const [path, pathPolicy] of Object.entries(policy?.paths ?? {})) {
+			if (pathPolicy.maxBytes === undefined) continue;
+			const value = getPath(state, path);
+			if (value === undefined) continue;
+			const bytes = Buffer.byteLength(JSON.stringify(value), "utf8");
+			if (bytes > pathPolicy.maxBytes) {
+				throw new GraphLimitError(
+					"MAX_STATE_PATH_BYTES",
+					`Graph state path ${path} is ${bytes} bytes; configured maxBytes is ${pathPolicy.maxBytes}`,
+				);
+			}
+		}
 	}
 
 	private prepareThreadStates(snapshot: CheckpointSnapshot, nodeIds: string[]): boolean {
@@ -580,7 +695,7 @@ export class GraphEngine {
 		const timestamp = nowIso();
 		const initial = deepMergeObjects(this.graph.definition.initialState ?? {}, { input: deepCloneJson(input) });
 		return {
-			version: 1,
+			version: 2,
 			runId: randomUUID(),
 			graphName: this.graph.definition.name,
 			graphHash: this.graph.hash,
@@ -616,7 +731,7 @@ export class GraphEngine {
 	private assertRunActive(
 		snapshot: CheckpointSnapshot,
 		signal: AbortSignal | undefined,
-		limits: Required<GraphLimits>,
+		limits: ResolvedGraphLimits,
 		baseActiveTimeMs: number,
 		invocationStartedAt: number,
 	): void {
@@ -649,7 +764,7 @@ export class GraphEngine {
 		snapshot: CheckpointSnapshot,
 		status: "completed" | "failed" | "cancelled",
 		error: string | undefined,
-		checkpointEnabled: boolean,
+		checkpointRun: CheckpointRun | undefined,
 		options: GraphRunOptions,
 		baseActiveTimeMs: number,
 		invocationStartedAt: number,
@@ -664,7 +779,7 @@ export class GraphEngine {
 			snapshot.pending = status === "completed" ? [] : snapshot.pending;
 		}
 		if (status !== "completed") snapshot.interrupt = undefined;
-		await this.save(snapshot, checkpointEnabled, options, baseActiveTimeMs, invocationStartedAt);
+		await this.save(snapshot, checkpointRun, options, baseActiveTimeMs, invocationStartedAt);
 		await this.emit(options, {
 			type: "graph_end",
 			runId: snapshot.runId,
@@ -674,20 +789,20 @@ export class GraphEngine {
 			message: error,
 			usage: copyUsage(snapshot.usage),
 		});
-		return resultFromSnapshot(snapshot);
+		return resultFromSnapshot(snapshot, this.graph.definition);
 	}
 
 	private async save(
 		snapshot: CheckpointSnapshot,
-		enabled: boolean,
+		checkpointRun: CheckpointRun | undefined,
 		options: GraphRunOptions,
 		baseActiveTimeMs: number,
 		invocationStartedAt: number,
 	): Promise<void> {
 		snapshot.activeTimeMs = baseActiveTimeMs + Math.max(0, Date.now() - invocationStartedAt);
 		snapshot.updatedAt = nowIso();
-		if (!enabled || !this.checkpointStore) return;
-		await this.checkpointStore.save(snapshot);
+		if (!checkpointRun) return;
+		await checkpointRun.commit(snapshot);
 		await this.emit(options, {
 			type: "checkpoint",
 			runId: snapshot.runId,
@@ -709,9 +824,9 @@ export class GraphEngine {
 
 class GraphBudget implements ExecutionBudget {
 	readonly usage: UsageLedger;
-	private readonly limits: Required<GraphLimits>;
+	private readonly limits: ResolvedGraphLimits;
 
-	constructor(initial: UsageLedger, limits: Required<GraphLimits>) {
+	constructor(initial: UsageLedger, limits: ResolvedGraphLimits) {
 		this.usage = copyUsage(initial);
 		this.limits = limits;
 	}
@@ -823,12 +938,12 @@ function failureResult(
 	attempts: number,
 	startedAt: string,
 	endedAt: string,
-	usage: NodeUsage = emptyNodeUsage(),
+	usage: NodeUsage = emptyUsage(),
 ): NodeExecutionFailure {
 	return { kind: "failure", error, code, retryable, usage, attempts, startedAt, endedAt };
 }
 
-function resolveLimits(configured: GraphLimits | undefined): Required<GraphLimits> {
+function resolveLimits(configured: GraphLimits | undefined): ResolvedGraphLimits {
 	return {
 		maxSteps: configured?.maxSteps ?? DEFAULT_LIMITS.maxSteps,
 		maxNodeRuns: configured?.maxNodeRuns ?? DEFAULT_LIMITS.maxNodeRuns,
@@ -837,11 +952,8 @@ function resolveLimits(configured: GraphLimits | undefined): Required<GraphLimit
 		maxTokens: configured?.maxTokens ?? DEFAULT_LIMITS.maxTokens,
 		timeoutMs: configured?.timeoutMs ?? DEFAULT_LIMITS.timeoutMs,
 		maxStateBytes: configured?.maxStateBytes ?? DEFAULT_LIMITS.maxStateBytes,
+		maxPromptBytes: configured?.maxPromptBytes ?? DEFAULT_LIMITS.maxPromptBytes,
 	};
-}
-
-function emptyNodeUsage(): NodeUsage {
-	return { ...emptyUsage() };
 }
 
 function mergeNodeUsage(target: NodeUsage, source: NodeUsage): void {
@@ -868,17 +980,61 @@ function usageKeys(): Array<keyof UsageLedger> {
 	return ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "turns", "costUsd"];
 }
 
-function resultFromSnapshot(snapshot: CheckpointSnapshot): GraphRunResult {
+function resultFromSnapshot(snapshot: CheckpointSnapshot, definition: GraphDefinition): GraphRunResult {
+	const resultPolicy = definition.result;
+	const includeState = resultPolicy?.includeState ?? false;
 	return {
 		runId: snapshot.runId,
 		status: snapshot.status,
 		state: deepCloneJson(snapshot.state),
+		result: projectResult(snapshot.state, resultPolicy?.paths),
+		stateBytes: stateSizeBytes(snapshot.state),
+		includeState,
+		resultMaxBytes: resultPolicy?.maxBytes ?? 16 * 1024,
 		usage: copyUsage(snapshot.usage),
 		step: snapshot.step,
 		nodeRuns: snapshot.nodeRuns,
 		interrupt: snapshot.interrupt,
 		error: snapshot.error,
 	};
+}
+
+function projectResult(state: JsonObject, configuredPaths: string[] | undefined): JsonObject | undefined {
+	const paths = configuredPaths ?? defaultResultPaths(state);
+	if (paths.length === 0) return undefined;
+	const projected: JsonObject = {};
+	for (const path of paths) {
+		const value = getPath(state, path);
+		if (value === undefined) continue;
+		setPath(projected, path, deepCloneJson(value));
+	}
+	return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function defaultResultPaths(state: JsonObject): string[] {
+	if (getPath(state, "result") !== undefined) return ["result"];
+	if (getPath(state, "report") !== undefined) return ["report"];
+	const outputs = getPath(state, "outputs");
+	if (isJsonObject(outputs) && Object.keys(outputs).length === 1) return ["outputs"];
+	return [];
+}
+
+function isCheckpointControlError(error: unknown): boolean {
+	return (
+		error instanceof CheckpointLeaseError ||
+		error instanceof CheckpointConflictError ||
+		error instanceof CheckpointDurabilityError ||
+		error instanceof CheckpointValidationError
+	);
+}
+
+async function closeCheckpointRun(checkpointRun: CheckpointRun | undefined): Promise<void> {
+	try {
+		await checkpointRun?.close();
+	} catch {
+		// Lease release is best-effort; expiry remains the recovery path. Cleanup must not
+		// replace a committed result or the primary execution/control error.
+	}
 }
 
 async function mapWithConcurrencyLimit<TInput, TOutput>(
@@ -890,15 +1046,23 @@ async function mapWithConcurrencyLimit<TInput, TOutput>(
 	const limit = Math.max(1, Math.min(concurrency, items.length));
 	const results = new Array<TOutput>(items.length);
 	let nextIndex = 0;
+	let failure: { error: unknown } | undefined;
 	const workers = Array.from({ length: limit }, async () => {
 		while (true) {
+			if (failure) return;
 			const index = nextIndex;
 			nextIndex += 1;
 			if (index >= items.length) return;
-			results[index] = await execute(items[index], index);
+			try {
+				results[index] = await execute(items[index], index);
+			} catch (error) {
+				failure ??= { error };
+				return;
+			}
 		}
 	});
 	await Promise.all(workers);
+	if (failure) throw failure.error;
 	return results;
 }
 

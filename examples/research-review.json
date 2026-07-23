@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "name": "research-review",
   "description": "Parallel repository and requirements research, synthesis, independent review, and bounded revision.",
   "entry": [
@@ -9,14 +9,47 @@
   "initialState": {
     "quality": {
       "minimumScore": 0.8
+    },
+    "control": {
+      "reviewRounds": 0
     }
   },
   "nodes": {
     "repo_research": {
       "type": "agent",
-      "purpose": "worker",
       "description": "Inspect the repository and collect implementation-relevant evidence.",
-      "prompt": "Research the repository for this task:\n\n{{input.task}}\n\nReturn concise findings with file paths, constraints, risks, and open questions.",
+      "prompt": "Research the repository for this task:\n\n{{input.task}}\n\nUse the available read, grep, find, and ls tools now. Return completed research with exact file paths and concrete source findings. Do not return a plan to inspect the repository later.",
+      "readOnly": true,
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "output": "research.repository",
+      "response": {
+        "format": "text",
+        "maxBytes": 65536
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 500
+      },
+      "idempotent": true,
+      "limits": {
+        "timeoutMs": 300000,
+        "maxTurns": 12,
+        "maxTokens": 80000,
+        "maxCostUsd": 0.75
+      },
+      "context": {
+        "mode": "isolated"
+      }
+    },
+    "repo_repair": {
+      "type": "agent",
+      "description": "Repair repository evidence when the reviewer identifies missing or inadequate source grounding.",
+      "prompt": "Re-run repository research for this task and replace the inadequate evidence.\n\nTask:\n{{input.task}}\n\nPrior repository evidence:\n{{research.repository}}\n\nRejected draft:\n{{draft}}\n\nReviewer feedback:\n{{review}}\n\nUse the available read, grep, find, and ls tools now. Return completed research with exact file paths and concrete source findings that address the feedback. Do not return a plan or an escalation memo.",
       "readOnly": true,
       "tools": [
         "read",
@@ -46,7 +79,6 @@
     },
     "requirements_research": {
       "type": "agent",
-      "purpose": "worker",
       "description": "Analyze the requested outcome, acceptance criteria, and edge cases independently from repository research.",
       "prompt": "Analyze this task as a requirements specialist:\n\n{{input.task}}\n\nReturn acceptance criteria, ambiguous points, edge cases, and a minimal definition of done.",
       "readOnly": true,
@@ -73,13 +105,7 @@
     },
     "writer": {
       "type": "agent",
-      "purpose": "worker",
       "description": "Synthesize the two research streams into one actionable proposal and revise it from reviewer feedback.",
-      "reads": [
-        "research.repository",
-        "research.requirements",
-        "review"
-      ],
       "prompt": "Produce the best actionable proposal for:\n\n{{input.task}}\n\nRepository evidence:\n{{research.repository}}\n\nRequirements analysis:\n{{research.requirements}}\n\nPrior independent review, when present:\n{{review}}\n\nThe proposal must identify the exact files or components to change, sequencing, verification, risks, and explicit non-goals.",
       "readOnly": true,
       "tools": [
@@ -112,13 +138,7 @@
       "type": "agent",
       "purpose": "reviewer",
       "description": "Independently verify the proposal against repository evidence and acceptance criteria.",
-      "reads": [
-        "draft",
-        "research.repository",
-        "research.requirements",
-        "quality.minimumScore"
-      ],
-      "prompt": "Review this proposal skeptically. Check factual grounding, completeness, feasibility, risk handling, and verification quality.\n\nTask:\n{{input.task}}\n\nProposal:\n{{draft}}\n\nEvidence:\n{{research.repository}}\n\nRequirements:\n{{research.requirements}}\n\nMinimum passing score: {{quality.minimumScore}}\n\nReturn JSON with exactly: {\"approved\": boolean, \"score\": number from 0 to 1, \"issues\": string[], \"requiredChanges\": string[]}.",
+      "prompt": "Review this proposal skeptically. Check factual grounding, completeness, feasibility, risk handling, and verification quality. Set needsRepositoryResearch to true only when the repository evidence itself is missing, stub-like, or inadequate and must be collected again; ordinary drafting fixes do not require more research.\n\nTask:\n{{input.task}}\n\nProposal:\n{{draft}}\n\nEvidence:\n{{research.repository}}\n\nRequirements:\n{{research.requirements}}\n\nMinimum passing score: {{quality.minimumScore}}\n\nReturn JSON with exactly: {\"approved\": boolean, \"score\": number from 0 to 1, \"needsRepositoryResearch\": boolean, \"issues\": string[], \"requiredChanges\": string[]}.",
       "readOnly": true,
       "tools": [
         "read",
@@ -136,6 +156,11 @@
         "backoffMs": 750
       },
       "idempotent": true,
+      "onError": {
+        "strategy": "route",
+        "to": "review_unavailable",
+        "output": "errors.reviewer"
+      },
       "limits": {
         "timeoutMs": 300000,
         "maxTurns": 10,
@@ -145,6 +170,70 @@
       "context": {
         "mode": "isolated"
       }
+    },
+    "record_review": {
+      "type": "set",
+      "description": "Count completed review rounds so the graph can exit before a hard execution limit.",
+      "assign": [
+        {
+          "path": "control.reviewRounds",
+          "value": 1
+        }
+      ]
+    },
+    "finalize": {
+      "type": "set",
+      "description": "Project an approved proposal and its review into the public result.",
+      "assign": [
+        {
+          "path": "result.status",
+          "value": "approved"
+        },
+        {
+          "path": "result.proposal",
+          "from": "draft"
+        },
+        {
+          "path": "result.review",
+          "from": "review"
+        }
+      ]
+    },
+    "best_effort": {
+      "type": "set",
+      "description": "Return the latest proposal and unresolved review after the bounded revision budget is exhausted.",
+      "assign": [
+        {
+          "path": "result.status",
+          "value": "best-effort"
+        },
+        {
+          "path": "result.proposal",
+          "from": "draft"
+        },
+        {
+          "path": "result.review",
+          "from": "review"
+        }
+      ]
+    },
+    "review_unavailable": {
+      "type": "set",
+      "description": "Preserve the latest proposal when structured reviewer output remains unavailable after retries.",
+      "assign": [
+        {
+          "path": "result.status",
+          "value": "review-unavailable"
+        },
+        {
+          "path": "result.proposal",
+          "from": "draft"
+        },
+        {
+          "path": "result.reviewError",
+          "from": "errors.reviewer"
+        }
+      ]
     }
   },
   "edges": [
@@ -158,11 +247,19 @@
     {
       "from": "writer",
       "to": "reviewer"
+    },
+    {
+      "from": "reviewer",
+      "to": "record_review"
+    },
+    {
+      "from": "repo_repair",
+      "to": "writer"
     }
   ],
   "routes": [
     {
-      "from": "reviewer",
+      "from": "record_review",
       "cases": [
         {
           "when": {
@@ -179,20 +276,58 @@
               }
             ]
           },
-          "to": "__end__"
+          "to": "finalize"
+        },
+        {
+          "when": {
+            "all": [
+              {
+                "path": "review.needsRepositoryResearch",
+                "op": "eq",
+                "value": true
+              },
+              {
+                "path": "control.reviewRounds",
+                "op": "lt",
+                "value": 3
+              }
+            ]
+          },
+          "to": "repo_repair"
+        },
+        {
+          "when": {
+            "path": "control.reviewRounds",
+            "op": "lt",
+            "value": 3
+          },
+          "to": "writer"
         }
       ],
-      "default": "writer"
+      "default": "best_effort"
     }
   ],
+  "reducers": {
+    "control.reviewRounds": "sum"
+  },
   "limits": {
-    "maxSteps": 8,
-    "maxNodeRuns": 12,
+    "maxSteps": 14,
+    "maxNodeRuns": 18,
     "maxConcurrency": 2,
-    "maxCostUsd": 3,
-    "maxTokens": 350000,
-    "timeoutMs": 1200000,
+    "maxCostUsd": 7,
+    "maxTokens": 800000,
+    "timeoutMs": 2400000,
     "maxStateBytes": 1048576
+  },
+  "result": {
+    "paths": [
+      "result.status",
+      "result.proposal",
+      "result.review",
+      "result.reviewError"
+    ],
+    "includeState": false,
+    "maxBytes": 131072
   },
   "policy": {
     "allowNonInteractive": true,

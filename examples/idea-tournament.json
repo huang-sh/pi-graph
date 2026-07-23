@@ -1,73 +1,123 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "name": "idea-tournament",
   "description": "Three isolated ideators propose solutions in parallel, aggregated into one array via an `append` reducer; an isolated judge waits at a multi-source barrier, then picks the best and scores it. Demonstrates parallel fan-out + reducer aggregation + barrier fan-in. All nodes pin `thinking: \"off\"` so the example runs cheaply and reliably even under a high-thinking default model.",
-  "entry": ["ideator_a", "ideator_b", "ideator_c"],
+  "entry": [
+    "ideator_a",
+    "ideator_b",
+    "ideator_c"
+  ],
   "reducers": {
     "ideas": "append"
   },
   "nodes": {
     "ideator_a": {
       "type": "agent",
-      "purpose": "worker",
       "description": "Propose the most practical, obviously-good solution.",
       "prompt": "Propose ONE specific, practical solution for this task. Be concrete and brief (2-3 sentences). Reason from the task; do not explore files.\n\nTask:\n{{input.task}}",
       "readOnly": true,
       "tools": [],
       "output": "ideas",
       "thinking": "off",
-      "context": { "mode": "isolated" },
-      "retry": { "maxAttempts": 2, "backoffMs": 800 },
+      "context": {
+        "mode": "isolated"
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 800
+      },
       "idempotent": true,
-      "limits": { "timeoutMs": 120000, "maxTurns": 4, "maxTokens": 20000, "maxCostUsd": 0.3 }
+      "limits": {
+        "timeoutMs": 120000,
+        "maxTurns": 4,
+        "maxTokens": 20000,
+        "maxCostUsd": 0.3
+      }
     },
     "ideator_b": {
       "type": "agent",
-      "purpose": "worker",
       "description": "Propose a contrarian solution.",
       "prompt": "Propose ONE contrarian solution for this task — something that sounds unconventional but could be brilliant. Be concrete and brief (2-3 sentences). Reason from the task; do not explore files.\n\nTask:\n{{input.task}}",
       "readOnly": true,
       "tools": [],
       "output": "ideas",
       "thinking": "off",
-      "context": { "mode": "isolated" },
-      "retry": { "maxAttempts": 2, "backoffMs": 800 },
+      "context": {
+        "mode": "isolated"
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 800
+      },
       "idempotent": true,
-      "limits": { "timeoutMs": 120000, "maxTurns": 4, "maxTokens": 20000, "maxCostUsd": 0.3 }
+      "limits": {
+        "timeoutMs": 120000,
+        "maxTurns": 4,
+        "maxTokens": 20000,
+        "maxCostUsd": 0.3
+      }
     },
     "ideator_c": {
       "type": "agent",
-      "purpose": "worker",
       "description": "Propose a lateral, unconventional solution.",
       "prompt": "Propose ONE lateral-thinking, unconventional solution for this task. Be concrete and brief (2-3 sentences). Reason from the task; do not explore files.\n\nTask:\n{{input.task}}",
       "readOnly": true,
       "tools": [],
       "output": "ideas",
       "thinking": "off",
-      "context": { "mode": "isolated" },
-      "retry": { "maxAttempts": 2, "backoffMs": 800 },
+      "context": {
+        "mode": "isolated"
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 800
+      },
       "idempotent": true,
-      "limits": { "timeoutMs": 120000, "maxTurns": 4, "maxTokens": 20000, "maxCostUsd": 0.3 }
+      "limits": {
+        "timeoutMs": 120000,
+        "maxTurns": 4,
+        "maxTokens": 20000,
+        "maxCostUsd": 0.3
+      }
     },
     "judge": {
       "type": "agent",
       "purpose": "reviewer",
       "description": "Wait at the barrier for all three proposals, then pick the best and score it.",
-      "reads": ["ideas"],
       "prompt": "Three candidate solutions were proposed, in order A, B, C:\n\n{{ideas}}\n\nEvaluate them on originality, usefulness, and feasibility. Pick the BEST one. Return JSON with EXACTLY this shape: {\"winner\": \"A\" | \"B\" | \"C\", \"score\": <number 0 to 1>, \"rationale\": \"<why this one wins, 1-2 sentences>\", \"summary\": \"<the winning idea restated in one sentence>\"}.",
       "readOnly": true,
       "tools": [],
       "output": "verdict",
-      "response": { "format": "json", "maxBytes": 32768 },
+      "response": {
+        "format": "json",
+        "maxBytes": 32768
+      },
       "thinking": "off",
-      "context": { "mode": "isolated" },
-      "retry": { "maxAttempts": 2, "backoffMs": 800 },
+      "context": {
+        "mode": "isolated"
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "backoffMs": 800
+      },
       "idempotent": true,
-      "limits": { "timeoutMs": 120000, "maxTurns": 4, "maxTokens": 25000, "maxCostUsd": 0.3 }
+      "limits": {
+        "timeoutMs": 120000,
+        "maxTurns": 4,
+        "maxTokens": 25000,
+        "maxCostUsd": 0.3
+      }
     }
   },
   "edges": [
-    { "from": ["ideator_a", "ideator_b", "ideator_c"], "to": "judge" }
+    {
+      "from": [
+        "ideator_a",
+        "ideator_b",
+        "ideator_c"
+      ],
+      "to": "judge"
+    }
   ],
   "limits": {
     "maxSteps": 6,

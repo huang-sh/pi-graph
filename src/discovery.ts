@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { GraphValidationError, parseAndCompileGraph } from "./compile.ts";
+import { GraphValidationError, compileGraph } from "./compile.ts";
 import type { Diagnostic, GraphDiscoveryResult, GraphScope, GraphSource } from "./types.ts";
 import { errorMessage } from "./utils.ts";
 
@@ -34,19 +34,21 @@ export function discoverGraphs(options: GraphDiscoveryOptions): GraphDiscoveryRe
 	}
 
 	const graphMap = new Map<string, GraphSource>();
-	for (const graph of userGraphs) graphMap.set(graph.name, graph);
-	for (const graph of projectGraphs) graphMap.set(graph.name, graph);
+	for (const graph of userGraphs) graphMap.set(graph.compiled.definition.name, graph);
+	for (const graph of projectGraphs) graphMap.set(graph.compiled.definition.name, graph);
 	return {
-		graphs: [...graphMap.values()].sort((left, right) => left.name.localeCompare(right.name)),
+		graphs: [...graphMap.values()].sort((left, right) =>
+			left.compiled.definition.name.localeCompare(right.compiled.definition.name),
+		),
 		projectGraphsDir,
 		diagnostics,
 	};
 }
 
 export function findGraph(discovery: GraphDiscoveryResult, name: string): GraphSource {
-	const graph = discovery.graphs.find((item) => item.name === name);
+	const graph = discovery.graphs.find((item) => item.compiled.definition.name === name);
 	if (graph) return graph;
-	const available = discovery.graphs.map((item) => item.name).join(", ") || "none";
+	const available = discovery.graphs.map((item) => item.compiled.definition.name).join(", ") || "none";
 	throw new Error(`Unknown graph ${JSON.stringify(name)}. Available graphs: ${available}`);
 }
 
@@ -66,15 +68,11 @@ function loadGraphsFromDir(dir: string, scope: "user" | "project", diagnostics: 
 		const filePath = join(dir, entry.name);
 		try {
 			const raw = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
-			const compiled = parseAndCompileGraph(raw, filePath);
+			const compiled = compileGraph(raw, filePath);
 			graphs.push({
-				name: compiled.definition.name,
-				description: compiled.definition.description,
 				filePath,
 				scope,
-				definition: compiled.definition,
-				hash: compiled.hash,
-				diagnostics: compiled.diagnostics,
+				compiled,
 			});
 		} catch (error) {
 			if (error instanceof GraphValidationError) {

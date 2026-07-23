@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { FileCheckpointStore } from "../src/checkpoint.ts";
+import { CheckpointLeaseError, FileCheckpointStore } from "../src/checkpoint.ts";
 import { compileGraph } from "../src/compile.ts";
 import { GraphEngine } from "../src/engine.ts";
 import { PiNodeExecutor } from "../src/pi-executor.ts";
@@ -36,7 +36,7 @@ class FunctionExecutor implements NodeExecutor {
 
 test("fan-out nodes join through a fan-in barrier", async () => {
 	const graph = compileGraph({
-		schemaVersion: 1,
+		schemaVersion: 2,
 		name: "fan-in",
 		entry: ["left", "right"],
 		nodes: {
@@ -71,7 +71,7 @@ test("fan-out nodes join through a fan-in barrier", async () => {
 
 test("conditional edge loops until a reviewer approves", async () => {
 	const graph = compileGraph({
-		schemaVersion: 1,
+		schemaVersion: 2,
 		name: "review-loop",
 		entry: "writer",
 		nodes: {
@@ -102,7 +102,7 @@ test("conditional edge loops until a reviewer approves", async () => {
 
 test("parallel writes require a reducer", async () => {
 	const definition: GraphDefinition = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		name: "conflict",
 		entry: ["a", "b"],
 		nodes: { a: agentNode(), b: agentNode() },
@@ -121,7 +121,7 @@ test("parallel writes require a reducer", async () => {
 
 test("retry policy re-runs a retryable idempotent node", async () => {
 	const graph = compileGraph({
-		schemaVersion: 1,
+		schemaVersion: 2,
 		name: "retry",
 		entry: "flaky",
 		nodes: {
@@ -141,9 +141,65 @@ test("retry policy re-runs a retryable idempotent node", async () => {
 	assert.equal(getPath(result.state, "outputs.flaky"), "ok");
 });
 
+test("retry backoff is cancelled with the run signal", async () => {
+	const controller = new AbortController();
+	const graph = compileGraph({
+		schemaVersion: 2,
+		name: "cancel-retry-backoff",
+		entry: "flaky",
+		nodes: {
+			flaky: { ...agentNode(), idempotent: true, retry: { maxAttempts: 2, backoffMs: 10_000 } },
+		},
+		limits: boundedLimits(),
+	});
+	let attempts = 0;
+	const executor = new FunctionExecutor(() => {
+		attempts += 1;
+		return failure("temporary", true);
+	});
+	const result = await new GraphEngine(graph, executor).run({
+		checkpoint: false,
+		signal: controller.signal,
+		onEvent: (event) => {
+			if (event.type === "node_retry") controller.abort();
+		},
+	});
+	assert.equal(result.status, "cancelled");
+	assert.match(result.error ?? "", /aborted/i);
+	assert.equal(attempts, 1);
+});
+
+test("zero retry backoff preserves immediate retry cancellation semantics", async () => {
+	const controller = new AbortController();
+	const graph = compileGraph({
+		schemaVersion: 2,
+		name: "cancel-zero-retry-backoff",
+		entry: "flaky",
+		nodes: {
+			flaky: { ...agentNode(), idempotent: true, retry: { maxAttempts: 2, backoffMs: 0 } },
+		},
+		limits: boundedLimits(),
+	});
+	let attempts = 0;
+	const executor = new FunctionExecutor(() => {
+		attempts += 1;
+		return failure("temporary", true);
+	});
+	const result = await new GraphEngine(graph, executor).run({
+		checkpoint: false,
+		signal: controller.signal,
+		onEvent: (event) => {
+			if (event.type === "node_retry") controller.abort();
+		},
+	});
+	assert.equal(result.status, "cancelled");
+	assert.equal(result.error, "Graph run aborted");
+	assert.equal(attempts, 1);
+});
+
 test("onError continue isolates a failed node", async () => {
 	const graph = compileGraph({
-		schemaVersion: 1,
+		schemaVersion: 2,
 		name: "isolation",
 		entry: "bad",
 		nodes: {
@@ -163,12 +219,34 @@ test("onError continue isolates a failed node", async () => {
 	assert.equal(result.nodeRuns, 2);
 });
 
+test("an executor-reported abort preserves external cancellation semantics", async () => {
+	const controller = new AbortController();
+	const graph = compileGraph({
+		schemaVersion: 2,
+		name: "external-cancellation",
+		entry: "worker",
+		nodes: { worker: agentNode() },
+		limits: boundedLimits(),
+	});
+	const executor = new FunctionExecutor(() => {
+		controller.abort(new Error("cancelled by caller"));
+		return {
+			...failure("worker observed abort", false),
+			code: "ABORTED",
+		};
+	});
+
+	const result = await new GraphEngine(graph, executor).run({ checkpoint: false, signal: controller.signal });
+	assert.equal(result.status, "cancelled");
+	assert.match(result.error ?? "", /cancelled|aborted/i);
+});
+
 test("human interrupt persists and resumes from the same step", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "pi-graph-test-"));
 	try {
 		const store = new FileCheckpointStore(directory);
 		const graph = compileGraph({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			name: "approval",
 			entry: "approval",
 			nodes: {
@@ -189,11 +267,134 @@ test("human interrupt persists and resumes from the same step", async () => {
 		assert.equal(getPath(resumed.state, "approval.accepted"), true);
 		assert.equal(getPath(resumed.state, "done"), true);
 		assert.equal(resumed.step, 2);
-		const snapshot = await store.load(interrupted.runId);
+		const { snapshot } = await store.load(interrupted.runId);
 		assert.equal(snapshot.status, "completed");
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
+});
+
+test("a run lease prevents two engine instances from resuming the same run", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-graph-concurrent-resume-"));
+	let releaseWorker: (() => void) | undefined;
+	try {
+		const graph = compileGraph({
+			schemaVersion: 2,
+			name: "exclusive-resume",
+			entry: "approval",
+			nodes: {
+				approval: { type: "human", kind: "confirm", prompt: "Approve?", output: "approved" },
+				worker: agentNode(),
+			},
+			edges: [{ from: "approval", to: "worker" }],
+			limits: boundedLimits(),
+		});
+		const initialStore = new FileCheckpointStore(directory);
+		const interrupted = await new GraphEngine(
+			graph,
+			new PiNodeExecutor({ cwd: process.cwd(), hasUI: false }),
+			{ checkpointStore: initialStore },
+		).run({ checkpoint: true });
+		assert.equal(interrupted.status, "interrupted");
+
+		let workerCalls = 0;
+		let markWorkerStarted: (() => void) | undefined;
+		const workerStarted = new Promise<void>((resolve) => {
+			markWorkerStarted = resolve;
+		});
+		const workerGate = new Promise<void>((resolve) => {
+			releaseWorker = resolve;
+		});
+		const executor = new FunctionExecutor(async (_node, context) => {
+			if (context.nodeId === "approval") return success(context, "approved", true);
+			workerCalls += 1;
+			markWorkerStarted?.();
+			await workerGate;
+			return success(context, "result", "done");
+		});
+		const firstResume = new GraphEngine(graph, executor, {
+			checkpointStore: new FileCheckpointStore(directory),
+		}).run({ runId: interrupted.runId, resumeValue: true, checkpoint: true });
+		await workerStarted;
+
+		await assert.rejects(
+			new GraphEngine(graph, executor, { checkpointStore: new FileCheckpointStore(directory) }).run({
+				runId: interrupted.runId,
+				resumeValue: true,
+				checkpoint: true,
+			}),
+			(error: unknown) => error instanceof CheckpointLeaseError && error.code === "RUN_LEASE_HELD",
+		);
+		releaseWorker?.();
+		releaseWorker = undefined;
+		const completed = await firstResume;
+		assert.equal(completed.status, "completed");
+		assert.equal(workerCalls, 1);
+	} finally {
+		releaseWorker?.();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("result projection keeps large internal state out of the user-facing result", async () => {
+	const graph = compileGraph({
+		schemaVersion: 2,
+		name: "project-result",
+		entry: "writer",
+		nodes: { writer: agentNode() },
+		result: { paths: ["result.summary"], includeState: false, maxBytes: 4096 },
+		limits: boundedLimits(),
+	});
+	const executor = new FunctionExecutor((_node, context) => ({
+		kind: "success",
+		writes: [
+			{ path: "working.transcript", value: "x".repeat(40_000), nodeId: context.nodeId },
+			{ path: "result.summary", value: "compact", nodeId: context.nodeId },
+		],
+		output: "compact",
+		usage: zeroNodeUsage(),
+		attempts: 1,
+		startedAt: new Date().toISOString(),
+		endedAt: new Date().toISOString(),
+	}));
+	const result = await new GraphEngine(graph, executor).run({ checkpoint: false });
+	assert.equal(result.status, "completed");
+	assert.ok(result.stateBytes > 40_000);
+	assert.deepEqual(result.result, { result: { summary: "compact" } });
+	assert.equal(result.includeState, false);
+});
+
+test("state path budgets fail the graph immediately after an oversized commit", async () => {
+	const graph = compileGraph({
+		schemaVersion: 2,
+		name: "state-path-budget",
+		entry: "writer",
+		nodes: { writer: agentNode() },
+		statePolicy: { paths: { "working.summary": { maxBytes: 32 } } },
+		limits: boundedLimits(),
+	});
+	const result = await new GraphEngine(
+		graph,
+		new FunctionExecutor((_node, context) => success(context, "working.summary", "x".repeat(100))),
+	).run({ checkpoint: false });
+	assert.equal(result.status, "failed");
+	assert.match(result.error ?? "", /working\.summary.*10[02] bytes.*maxBytes is 32/i);
+});
+
+test("graph state budgets fail before oversized state can advance the graph", async () => {
+	const graph = compileGraph({
+		schemaVersion: 2,
+		name: "hot-state-budget",
+		entry: "writer",
+		nodes: { writer: agentNode() },
+		limits: { ...boundedLimits(), maxStateBytes: 64 },
+	});
+	const result = await new GraphEngine(
+		graph,
+		new FunctionExecutor((_node, context) => success(context, "working.large", "x".repeat(100))),
+	).run({ checkpoint: false });
+	assert.equal(result.status, "failed");
+	assert.match(result.error ?? "", /graph state is .*bytes.*maxStateBytes is 64/i);
 });
 
 function agentNode(): AgentNodeDefinition {

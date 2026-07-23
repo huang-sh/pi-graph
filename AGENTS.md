@@ -1,7 +1,7 @@
 # pi-graph development notes
 
 - Keep the runtime dependency-free beyond Pi peer packages and Node built-ins.
-- Preserve `schemaVersion: 1` compatibility unless a migration path is added.
+- Accept only the current `schemaVersion: 2`; future breaking schema changes require an explicit migration path.
 - Do not use `eval` for routes or templates.
 - Do not weaken project trust, mutation confirmation, path validation, or hard limits.
 - Agent retries require explicit idempotency review.

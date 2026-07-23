@@ -145,10 +145,6 @@ export function getPath(root: JsonObject, path: string): JsonValue | undefined {
 	return current;
 }
 
-export function hasPath(root: JsonObject, path: string): boolean {
-	return getPath(root, path) !== undefined;
-}
-
 export function setPath(root: JsonObject, path: string, value: JsonValue): void {
 	const segments = normalizePath(path);
 	let current = root;
@@ -169,6 +165,20 @@ export function setPath(root: JsonObject, path: string, value: JsonValue): void 
 	current[segments[segments.length - 1]] = deepCloneJson(value);
 }
 
+export function unsetPath(root: JsonObject, path: string): void {
+	const segments = normalizePath(path);
+	let current = root;
+	for (let index = 0; index < segments.length - 1; index++) {
+		const existing = current[segments[index]];
+		if (existing === undefined) return;
+		if (!isJsonObject(existing)) {
+			throw new Error(`Cannot unset ${path}: ${segments.slice(0, index + 1).join(".")} is not an object`);
+		}
+		current = existing;
+	}
+	delete current[segments[segments.length - 1]];
+}
+
 export function deepMergeObjects(base: JsonObject, overlay: JsonObject): JsonObject {
 	const result = deepCloneJson(base);
 	for (const [key, value] of Object.entries(overlay)) {
@@ -187,6 +197,25 @@ export function renderTemplate(template: string, state: JsonObject): string {
 	});
 }
 
+export function extractTemplatePaths(template: string): string[] {
+	const paths: string[] = [];
+	for (const match of template.matchAll(/{{\s*([^{}]+?)\s*}}/g)) {
+		const path = match[1]?.trim();
+		if (!path) continue;
+		normalizePath(path);
+		if (!paths.includes(path)) paths.push(path);
+	}
+	return paths;
+}
+
+export function statePathsOverlap(leftPath: string, rightPath: string): boolean {
+	const left = normalizePath(leftPath);
+	const right = normalizePath(rightPath);
+	const shorter = left.length <= right.length ? left : right;
+	const longer = shorter === left ? right : left;
+	return shorter.every((segment, index) => longer[index] === segment);
+}
+
 export function applyStateWrites(
 	state: JsonObject,
 	writes: StateWrite[],
@@ -203,13 +232,40 @@ export function applyStateWrites(
 	assertNoOverlappingWritePaths([...grouped.keys()]);
 	const next = deepCloneJson(state);
 	for (const [path, pathWrites] of grouped) {
+		const explicitWrites = pathWrites.filter((write) => (write.mode ?? "reduce") !== "reduce");
+		if (explicitWrites.length > 0) {
+			if (pathWrites.length !== 1) {
+				throw new Error(`State write mode overwrite/unset at ${path} must be the only write to that path in one superstep.`);
+			}
+			const write = explicitWrites[0];
+			if (write.mode === "unset") {
+				if (write.value !== undefined) throw new Error(`Unset write at ${path} must not include a value`);
+				unsetPath(next, path);
+				continue;
+			}
+			if (write.value === undefined) throw new Error(`Overwrite write at ${path} requires a value`);
+			setPath(next, path, write.value);
+			continue;
+		}
+
 		const reducer = reducers[path];
 		if (pathWrites.length > 1 && reducer === undefined) {
 			const nodes = pathWrites.map((write) => write.nodeId).join(", ");
 			throw new Error(`Parallel state conflict at ${path}; writers: ${nodes}. Configure a reducer for this path.`);
 		}
+		if (reducer === "collect") {
+			const collected = pathWrites.map((write) => {
+				if (write.value === undefined) throw new Error(`Collect write at ${path} requires a value`);
+				return deepCloneJson(write.value);
+			});
+			setPath(next, path, collected);
+			continue;
+		}
 		let value = getPath(next, path);
-		for (const write of pathWrites) value = reduceValue(value, write.value, reducer ?? "replace", path);
+		for (const write of pathWrites) {
+			if (write.value === undefined) throw new Error(`State write at ${path} requires a value`);
+			value = reduceValue(value, write.value, reducer ?? "replace", path);
+		}
 		if (value === undefined) throw new Error(`Reducer for ${path} returned undefined`);
 		setPath(next, path, value);
 	}
@@ -240,6 +296,8 @@ function reduceValue(previous: JsonValue | undefined, incoming: JsonValue, reduc
 			list.push(deepCloneJson(incoming));
 			return list;
 		}
+		case "collect":
+			throw new Error(`Reducer collect at ${path} must be applied to the complete superstep write batch`);
 		case "concat": {
 			const left = previous === undefined ? [] : Array.isArray(previous) ? previous : [previous];
 			const right = Array.isArray(incoming) ? incoming : [incoming];
@@ -278,19 +336,6 @@ export function uniqueStrings(values: string[]): string[] {
 
 export function asStringArray(value: string | string[]): string[] {
 	return Array.isArray(value) ? value : [value];
-}
-
-export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-	if (ms <= 0) return Promise.resolve();
-	return new Promise((resolve, reject) => {
-		const timer = setTimeout(resolve, ms);
-		const abort = () => {
-			clearTimeout(timer);
-			reject(new Error("Operation aborted"));
-		};
-		if (signal?.aborted) abort();
-		else signal?.addEventListener("abort", abort, { once: true });
-	});
 }
 
 export function assertPositiveInteger(value: number | undefined, label: string): void {

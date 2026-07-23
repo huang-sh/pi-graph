@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import test from "node:test";
 import { FileCheckpointStore } from "../src/checkpoint.ts";
 import { compileGraph } from "../src/compile.ts";
@@ -25,8 +24,9 @@ import { emptyUsage, getPath } from "../src/utils.ts";
 // that actually exercises science-research.json's non-linear control flow:
 // human gate interrupt/resume, fan-out + barrier, the conflict-triggered
 // debate detour, the integrator's nested conditional route, the refinement
-// loop through a deterministic set node, and append reducers.
-const here = dirname(fileURLToPath(import.meta.url));
+// loop through deterministic cleanup, per-superstep collect reducers, and
+// compact cross-round memory.
+const here = import.meta.dirname;
 const definition = JSON.parse(readFileSync(join(here, "..", "examples", "science-research.json"), "utf8")) as GraphDefinition;
 
 function nowIso(): string {
@@ -50,13 +50,17 @@ class ScenarioExecutor implements NodeExecutor {
 	private handle(node: NodeDefinition, context: NodeExecutionContext): NodeExecutionResult {
 		const id = context.nodeId;
 
-		// Deterministic set-node handling (supports `from` and `value` sources,
-		// which covers bump_round's `{ path: "history", from: "integration" }`).
+		// Deterministic set-node handling, including overwrite/unset lifecycle writes.
 		if (node.type === "set") {
 			const writes: StateWrite[] = [];
-			for (const assign of (node as { assign?: Array<{ path: string; from?: string; value?: JsonValue }> }).assign ?? []) {
-				if (assign.from !== undefined) writes.push({ path: assign.path, value: getPath(context.state, assign.from) ?? null, nodeId: id });
-				else if (assign.value !== undefined) writes.push({ path: assign.path, value: assign.value, nodeId: id });
+			for (const assign of node.assign) {
+				const mode = assign.mode ?? "reduce";
+				if (mode === "unset") {
+					writes.push({ path: assign.path, nodeId: id, mode });
+					continue;
+				}
+				const value = assign.from !== undefined ? getPath(context.state, assign.from) ?? null : assign.value ?? null;
+				writes.push({ path: assign.path, value, nodeId: id, mode });
 			}
 			return this.ok(writes, null);
 		}
@@ -65,7 +69,7 @@ class ScenarioExecutor implements NodeExecutor {
 			case "scope_gate": {
 				// Human select node: interrupt for input, then accept the resumed value.
 				if (context.resumeValue !== undefined) {
-					return this.ok([{ path: "scope.decision", value: context.resumeValue, nodeId: id }], context.resumeValue);
+					return this.ok([{ path: "control.scope_decision", value: context.resumeValue, nodeId: id }], context.resumeValue);
 				}
 				return {
 					kind: "interrupt",
@@ -78,31 +82,64 @@ class ScenarioExecutor implements NodeExecutor {
 			}
 			case "planner": {
 				this.round += 1;
-				return this.ok([{ path: "plan", value: { round: this.round }, nodeId: id }], { round: this.round });
+				return this.ok([{ path: "working.plan", value: { round: this.round }, nodeId: id }], { round: this.round });
 			}
 			case "branch_a":
 			case "branch_b":
 			case "branch_c":
-				return this.ok([{ path: "branch_results", value: { angle: id }, nodeId: id }], { angle: id });
+				return this.ok([{ path: "working.branch_results", value: { angle: id, round: this.round }, nodeId: id }], { angle: id });
 			case "evidence_critic": {
 				// Round 1: a critical conflict between branches triggers the debate detour.
 				const hasCriticalConflicts = this.round === 1;
-				return this.ok([{ path: "reviewed_evidence", value: { has_critical_conflicts: hasCriticalConflicts }, nodeId: id }], { has_critical_conflicts: hasCriticalConflicts });
+				return this.ok(
+					[{ path: "working.reviewed_evidence", value: { has_critical_conflicts: hasCriticalConflicts }, nodeId: id }],
+					{ has_critical_conflicts: hasCriticalConflicts },
+				);
 			}
 			case "devil_advocate":
-				return this.ok([{ path: "debate.advocate", value: { position: "skeptic" }, nodeId: id }], { position: "skeptic" });
+				return this.ok(
+					[
+						{
+							path: "working.debate.messages",
+							value: [{ role: "assistant", content: "skeptic", nodeId: id, createdAt: nowIso(), name: null }],
+							nodeId: id,
+						},
+					],
+					{ position: "skeptic" },
+				);
 			case "defender":
-				return this.ok([{ path: "debate.defense", value: { position: "defender" }, nodeId: id }], { position: "defender" });
+				return this.ok(
+					[
+						{
+							path: "working.debate.messages",
+							value: [{ role: "assistant", content: "defender", nodeId: id, createdAt: nowIso(), name: null }],
+							nodeId: id,
+						},
+					],
+					{ position: "defender" },
+				);
 			case "arbiter":
-				return this.ok([{ path: "debate.verdict", value: { resolved: false, fatal_conflict: false }, nodeId: id }], { resolved: false });
+				return this.ok(
+					[{ path: "working.debate.verdict", value: { resolved: false, fatal_conflict: false }, nodeId: id }],
+					{ resolved: false },
+				);
 			case "integrator": {
 				// Round 1: insufficient -> refine via bump_round -> planner. Round 2: sufficient -> report.
 				const sufficient = this.round >= 2;
 				const integration = { sufficient, fatal_conflict: false, round: this.round };
-				return this.ok([{ path: "integration", value: integration, nodeId: id }], integration);
+				return this.ok([{ path: "working.integration", value: integration, nodeId: id }], integration);
 			}
 			case "reporter":
-				return this.ok([{ path: "report", value: { done: true }, nodeId: id }], { done: true });
+				return this.ok(
+					[
+						{
+							path: "result.report_artifact",
+							value: { kind: "artifact", uri: "/tmp/report.md", mediaType: "text/markdown", bytes: 10, sha256: "abc", preview: "report" },
+							nodeId: id,
+						},
+					],
+					{ done: true },
+				);
 			default:
 				return this.ok([], null);
 		}
@@ -132,7 +169,7 @@ test("science-research: full non-linear control flow (gate, debate detour, refin
 		assert.equal(completed.status, "completed");
 
 		// --- Human gate: approved, and NOT re-entered on the refinement round ---
-		assert.equal(getPath(completed.state, "scope.decision"), "approve");
+		assert.equal(getPath(completed.state, "control.scope_decision"), "approve");
 		assert.equal(count(executor.calls, "scope_gate"), 2, "scope_gate runs once (interrupt) + once (resume), never on the refine round");
 
 		// --- Refinement loop: planner/evidence_critic/integrator each ran twice ---
@@ -140,12 +177,14 @@ test("science-research: full non-linear control flow (gate, debate detour, refin
 		assert.equal(count(executor.calls, "evidence_critic"), 2);
 		assert.equal(count(executor.calls, "integrator"), 2);
 
-		// --- Fan-out + barrier: 3 branches per round, appended into one array ---
-		const branchResults = getPath(completed.state, "branch_results");
-		assert.ok(Array.isArray(branchResults), "branch_results is an array (append reducer)");
-		assert.equal(branchResults.length, 6, "3 branches x 2 rounds");
+		// collect is scoped to one superstep: old round branch results are replaced.
+		const branchResults = getPath(completed.state, "working.branch_results");
+		assert.ok(Array.isArray(branchResults), "working.branch_results is a current-round collection");
+		assert.equal(branchResults.length, 3);
+		assert.ok(branchResults.every((item) => getPath(item as JsonObject, "round") === 2), "only round-2 branch cards remain");
 
-		// --- Conflict-triggered debate detour ran exactly once (round 1) ---
+		// The conflict-triggered debate ran in round 1, then bump_round removed all
+		// round-scoped working data before round 2.
 		assert.equal(count(executor.calls, "devil_advocate"), 1);
 		assert.equal(count(executor.calls, "defender"), 1);
 		assert.equal(count(executor.calls, "arbiter"), 1);
@@ -153,26 +192,24 @@ test("science-research: full non-linear control flow (gate, debate detour, refin
 		const idxDefender = executor.calls.indexOf("defender");
 		const idxArbiter = executor.calls.indexOf("arbiter");
 		assert.ok(idxAdvocate < idxDefender && idxDefender < idxArbiter, "debate chain order: advocate -> defender -> arbiter");
-		assert.deepEqual(getPath(completed.state, "debate.advocate"), { position: "skeptic" });
-		assert.deepEqual(getPath(completed.state, "debate.verdict"), { resolved: false, fatal_conflict: false });
+		assert.equal(getPath(completed.state, "working.debate"), undefined, "stale round-1 debate was cleaned");
 
-		// --- Deterministic set node archived exactly the round-1 integration ---
-		const history = getPath(completed.state, "history");
-		assert.ok(Array.isArray(history), "history is an array (append reducer on the set node)");
-		assert.equal(history.length, 1, "only round 1 was archived by bump_round");
-		assert.deepEqual(getPath(history[0] as JsonObject, "round"), 1);
+		// The cleanup node keeps only the latest compact cross-round memory.
+		assert.equal(getPath(completed.state, "memory.round_summaries"), undefined);
+		assert.equal(getPath(completed.state, "memory.last_integration.round"), 1);
 
-		// --- Refine loop ordering: first integrator -> bump_round -> second planner ---
 		const firstIntegrator = executor.calls.indexOf("integrator");
 		const bumpRound = executor.calls.indexOf("bump_round");
 		const secondPlanner = executor.calls.indexOf("planner", firstIntegrator);
-		assert.ok(firstIntegrator < bumpRound && bumpRound < secondPlanner, "insufficient integrator -> bump_round -> planner (refine loop)");
+		assert.ok(firstIntegrator < bumpRound && bumpRound < secondPlanner, "insufficient integrator -> cleanup/archive -> planner");
 
-		// --- Final integration is sufficient and the report was produced ---
-		assert.equal(getPath(completed.state, "integration.sufficient"), true);
-		assert.equal(getPath(completed.state, "integration.round"), 2);
-		assert.deepEqual(getPath(completed.state, "report"), { done: true });
+		assert.equal(getPath(completed.state, "working.integration.sufficient"), true);
+		assert.equal(getPath(completed.state, "working.integration.round"), 2);
+		assert.equal(getPath(completed.state, "result.report_artifact.kind"), "artifact");
 		assert.equal(count(executor.calls, "reporter"), 1);
+		assert.equal(completed.includeState, false);
+		assert.equal(getPath(completed.result ?? {}, "result.report_artifact.kind"), "artifact");
+
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}

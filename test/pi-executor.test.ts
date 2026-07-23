@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,7 +20,7 @@ test("Pi node executor consumes Pi JSON events and writes structured output", as
 		);
 		await chmod(fakePi, 0o755);
 		const graph = compileGraph({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			name: "fake-pi",
 			entry: "review",
 			nodes: {
@@ -62,12 +62,13 @@ test("shared context appends messages to graph state and injects them into the n
 		const fakePi = join(directory, "fake-pi.mjs");
 		await writeFile(
 			fakePi,
-			`#!/usr/bin/env node\nlet input = "";\nfor await (const chunk of process.stdin) input += chunk;\nconst text = input.includes("second instruction") && input.includes("first-response") ? "saw-first-response" : "first-response";\nconst message = { role: "assistant", content: [{ type: "text", text }], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, model: "fake/model", stopReason: "stop" };\nprocess.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");\n`,
+			`#!/usr/bin/env node\nlet input = "";\nfor await (const chunk of process.stdin) input += chunk;\nconst occurrences = input.split("first-response").length - 1;
+const text = input.includes("second instruction") ? (occurrences === 1 ? "saw-first-response-once" : "duplicate-count-" + occurrences) : "first-response";\nconst message = { role: "assistant", content: [{ type: "text", text }], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, model: "fake/model", stopReason: "stop" };\nprocess.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");\n`,
 			{ encoding: "utf8", mode: 0o755 },
 		);
 		await chmod(fakePi, 0o755);
 		const graph = compileGraph({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			name: "shared-history",
 			entry: "first",
 			nodes: {
@@ -85,6 +86,7 @@ test("shared context appends messages to graph state and injects them into the n
 					readOnly: true,
 					tools: [],
 					output: "outputs.second",
+					reads: ["outputs.first"],
 					context: { mode: "shared", messagesPath: "conversation.messages" },
 				},
 			},
@@ -102,16 +104,276 @@ test("shared context appends messages to graph state and injects them into the n
 		const executor = new PiNodeExecutor({ cwd: directory, hasUI: false, piCommand: fakePi });
 		const result = await new GraphEngine(graph, executor).run({ checkpoint: false });
 		assert.equal(result.status, "completed");
-		assert.equal(getPath(result.state, "outputs.second"), "saw-first-response");
+		assert.equal(getPath(result.state, "outputs.second"), "saw-first-response-once");
+		const messages = getPath(result.state, "conversation.messages") as Array<Record<string, unknown>>;
 		assert.deepEqual(
-			(getPath(result.state, "conversation.messages") as Array<Record<string, unknown>>).map((message) => [message.role, message.content]),
+			messages.map((message) => [message.role, message.statePath]),
 			[
-				["user", "first instruction"],
-				["assistant", "first-response"],
-				["user", "second instruction"],
-				["assistant", "saw-first-response"],
+				["assistant", "outputs.first"],
+				["assistant", "outputs.second"],
 			],
 		);
+		assert.ok(messages.every((message) => typeof message.content === "string" && !message.content.includes("first-response")));
+		assert.ok(messages.every((message) => typeof message.stateHash === "string" && message.stateHash.length === 64));
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("compact shared references do not replay a newer value as historical output", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-graph-shared-reference-integrity-"));
+	try {
+		const fakePi = join(directory, "fake-pi.mjs");
+		const counter = join(directory, "counter");
+		await writeFile(
+			fakePi,
+			`#!/usr/bin/env node\nimport { readFile, writeFile } from "node:fs/promises";\nlet input = ""; for await (const chunk of process.stdin) input += chunk;\nlet count = 0; try { count = Number(await readFile(${JSON.stringify(counter)}, "utf8")); } catch {}\ncount += 1; await writeFile(${JSON.stringify(counter)}, String(count));\nlet text;\nif (count === 1) text = "old-value";\nelse if (count === 2) text = "new-value";\nelse text = JSON.stringify({ oldCount: input.split("old-value").length - 1, newCount: input.split("new-value").length - 1, overwrittenMarker: input.includes("state path was overwritten") });\nconst message = { role: "assistant", content: [{ type: "text", text }], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, model: "fake/model", stopReason: "stop" };\nprocess.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");\n`,
+			{ encoding: "utf8", mode: 0o755 },
+		);
+		await chmod(fakePi, 0o755);
+		const graph = compileGraph({
+			schemaVersion: 2,
+			name: "shared-reference-integrity",
+			entry: "first",
+			nodes: {
+				first: {
+					type: "agent",
+					prompt: "first",
+					readOnly: true,
+					tools: [],
+					output: "shared.latest",
+					context: { mode: "shared", messagesPath: "conversation.messages" },
+				},
+				second: {
+					type: "agent",
+					prompt: "second",
+					readOnly: true,
+					tools: [],
+					output: "shared.latest",
+					context: { mode: "shared", messagesPath: "conversation.messages" },
+				},
+				observer: {
+					type: "agent",
+					prompt: "observe",
+					readOnly: true,
+					tools: [],
+					output: "result.observation",
+					response: { format: "json" },
+					context: { mode: "shared", messagesPath: "conversation.messages", capture: "none" },
+				},
+			},
+			edges: [
+				{ from: "first", to: "second" },
+				{ from: "second", to: "observer" },
+			],
+		});
+		const result = await new GraphEngine(graph, new PiNodeExecutor({ cwd: directory, hasUI: false, piCommand: fakePi })).run({
+			checkpoint: false,
+		});
+		assert.equal(result.status, "completed", result.error);
+		assert.deepEqual(getPath(result.state, "result.observation"), {
+			oldCount: 0,
+			newCount: 1,
+			overwrittenMarker: true,
+		});
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("shared message retention prunes the durable channel after each commit", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-graph-shared-retention-"));
+	try {
+		const fakePi = join(directory, "fake-pi.mjs");
+		const counter = join(directory, "counter");
+		await writeFile(
+			fakePi,
+			`#!/usr/bin/env node\nimport { readFile, writeFile } from "node:fs/promises";\nfor await (const _chunk of process.stdin) {}\nlet count = 0; try { count = Number(await readFile(${JSON.stringify(counter)}, "utf8")); } catch {}\ncount += 1; await writeFile(${JSON.stringify(counter)}, String(count));\nconst message = { role: "assistant", content: [{ type: "text", text: "turn-" + count }], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, model: "fake/model", stopReason: "stop" };\nprocess.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");\n`,
+			{ encoding: "utf8", mode: 0o755 },
+		);
+		await chmod(fakePi, 0o755);
+		const graph = compileGraph({
+			schemaVersion: 2,
+			name: "shared-retention",
+			entry: "worker",
+			nodes: {
+				worker: {
+					type: "agent",
+					prompt: "continue",
+					readOnly: true,
+					tools: [],
+					response: { storeOutput: false },
+					context: {
+						mode: "shared",
+						messagesPath: "conversation.messages",
+						capture: "assistant-only",
+						maxStoredMessages: 2,
+					},
+				},
+			},
+			edges: [{ from: "worker", to: "worker" }],
+			limits: { maxSteps: 4, maxNodeRuns: 8, maxConcurrency: 1, maxCostUsd: 1, maxTokens: 1000, timeoutMs: 10000, maxStateBytes: 100000 },
+		});
+		const result = await new GraphEngine(graph, new PiNodeExecutor({ cwd: directory, hasUI: false, piCommand: fakePi })).run({
+			checkpoint: false,
+		});
+		assert.equal(result.status, "failed");
+		const messages = getPath(result.state, "conversation.messages") as Array<Record<string, unknown>>;
+		assert.deepEqual(messages.map((message) => message.content), ["turn-3", "turn-4"]);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("shared assistant-only capture can be the canonical output without duplicating a node output path", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-graph-shared-canonical-"));
+	try {
+		const fakePi = join(directory, "fake-pi.mjs");
+		await writeFile(
+			fakePi,
+			`#!/usr/bin/env node\nfor await (const _chunk of process.stdin) {}\nconst message = { role: "assistant", content: [{ type: "text", text: "only-copy" }], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, model: "fake/model", stopReason: "stop" };\nprocess.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");\n`,
+			{ encoding: "utf8", mode: 0o755 },
+		);
+		await chmod(fakePi, 0o755);
+		const graph = compileGraph({
+			schemaVersion: 2,
+			name: "shared-canonical",
+			entry: "debater",
+			nodes: {
+				debater: {
+					type: "agent",
+					prompt: "debate",
+					readOnly: true,
+					tools: [],
+					response: { storeOutput: false },
+					context: { mode: "shared", messagesPath: "debate.messages", capture: "assistant-only" },
+				},
+			},
+		});
+		const result = await new GraphEngine(graph, new PiNodeExecutor({ cwd: directory, hasUI: false, piCommand: fakePi })).run({
+			checkpoint: false,
+		});
+		assert.equal(getPath(result.state, "outputs.debater"), undefined);
+		assert.deepEqual(
+			(getPath(result.state, "debate.messages") as Array<Record<string, unknown>>).map((message) => message.content),
+			["only-copy"],
+		);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("prompt construction omits reads already interpolated by the template", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-graph-prompt-dedupe-"));
+	try {
+		const fakePi = join(directory, "fake-pi.mjs");
+		await writeFile(
+			fakePi,
+			`#!/usr/bin/env node\nlet input = ""; for await (const chunk of process.stdin) input += chunk;\nconst count = input.split("UNIQUE-EVIDENCE").length - 1;\nconst message = { role: "assistant", content: [{ type: "text", text: String(count) }], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, model: "fake/model", stopReason: "stop" };\nprocess.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");\n`,
+			{ encoding: "utf8", mode: 0o755 },
+		);
+		await chmod(fakePi, 0o755);
+		const graph = compileGraph({
+			schemaVersion: 2,
+			name: "prompt-dedupe",
+			entry: "worker",
+			initialState: { evidence: "UNIQUE-EVIDENCE" },
+			nodes: {
+				worker: {
+					type: "agent",
+					prompt: "Evidence={{evidence}}",
+					reads: ["evidence"],
+					readOnly: true,
+					tools: [],
+					output: "count",
+				},
+			},
+		});
+		const result = await new GraphEngine(graph, new PiNodeExecutor({ cwd: directory, hasUI: false, piCommand: fakePi })).run({
+			checkpoint: false,
+		});
+		assert.equal(getPath(result.state, "count"), "1");
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("prompt byte budgets fail before spawning Pi", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-graph-prompt-budget-"));
+	try {
+		const marker = join(directory, "spawned");
+		const fakePi = join(directory, "fake-pi.mjs");
+		await writeFile(fakePi, `#!/usr/bin/env node\nimport { writeFile } from "node:fs/promises"; await writeFile(${JSON.stringify(marker)}, "yes");\n`, {
+			encoding: "utf8",
+			mode: 0o755,
+		});
+		await chmod(fakePi, 0o755);
+		const graph = compileGraph({
+			schemaVersion: 2,
+			name: "prompt-budget",
+			entry: "worker",
+			initialState: { evidence: "x".repeat(2000) },
+			nodes: {
+				worker: {
+					type: "agent",
+					prompt: "Review",
+					reads: ["evidence"],
+					readOnly: true,
+					tools: [],
+					limits: { maxPromptBytes: 510 },
+				},
+			},
+		});
+		assert.deepEqual(graph.definition.nodes.worker.limits, { maxPromptBytes: 510 });
+		const result = await new GraphEngine(graph, new PiNodeExecutor({ cwd: directory, hasUI: false, piCommand: fakePi })).run({
+			checkpoint: false,
+		});
+		assert.equal(result.status, "failed");
+		assert.match(result.error ?? "", /maxPromptBytes/);
+		await assert.rejects(readFile(marker, "utf8"), /ENOENT/);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("artifact response storage keeps full output out of graph state", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-graph-artifact-"));
+	try {
+		const fakePi = join(directory, "fake-pi.mjs");
+		const report = "# Report\\n\\n" + "evidence ".repeat(1000);
+		await writeFile(
+			fakePi,
+			`#!/usr/bin/env node\nfor await (const _chunk of process.stdin) {}\nconst message = { role: "assistant", content: [{ type: "text", text: ${JSON.stringify(report)} }], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, model: "fake/model", stopReason: "stop" };\nprocess.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");\n`,
+			{ encoding: "utf8", mode: 0o755 },
+		);
+		await chmod(fakePi, 0o755);
+		const graph = compileGraph({
+			schemaVersion: 2,
+			name: "artifact-output",
+			entry: "reporter",
+			nodes: {
+				reporter: {
+					type: "agent",
+					prompt: "report",
+					readOnly: true,
+					tools: [],
+					output: "result.report",
+					response: { storage: "artifact", mediaType: "text/markdown", previewBytes: 64, maxBytes: 20000 },
+				},
+			},
+			result: { paths: ["result.report"] },
+		});
+		const artifactsDir = join(directory, "artifacts");
+		const result = await new GraphEngine(
+			graph,
+			new PiNodeExecutor({ cwd: directory, hasUI: false, piCommand: fakePi, artifactsDir }),
+		).run({ checkpoint: false });
+		const reference = getPath(result.state, "result.report") as Record<string, unknown>;
+		assert.equal(reference.kind, "artifact");
+		assert.equal(reference.bytes, Buffer.byteLength(report, "utf8"));
+		assert.equal(await readFile(String(reference.uri), "utf8"), report);
+		assert.ok(Buffer.byteLength(JSON.stringify(result.state), "utf8") < 1000);
+		assert.deepEqual(result.result, { result: { report: reference } });
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
@@ -131,7 +393,7 @@ test("thread context resumes the same private Pi session after a graph interrupt
 		const threadDir = join(directory, "threads");
 		const store = new FileCheckpointStore(checkpointDir);
 		const graph = compileGraph({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			name: "thread-resume",
 			entry: "first",
 			nodes: {
@@ -163,7 +425,7 @@ test("thread context resumes the same private Pi session after a graph interrupt
 				maxConcurrency: 1,
 				maxCostUsd: 1,
 				maxTokens: 1000,
-				timeoutMs: 10000,
+				timeoutMs: 30000,
 				maxStateBytes: 100000,
 			},
 		});
@@ -178,9 +440,9 @@ test("thread context resumes the same private Pi session after a graph interrupt
 			resumeValue: true,
 			checkpoint: true,
 		});
-		assert.equal(resumed.status, "completed");
+		assert.equal(resumed.status, "completed", resumed.error);
 		assert.equal(getPath(resumed.state, "outputs.second"), "thread-turn-2");
-		const snapshot = await store.load(interrupted.runId);
+		const { snapshot } = await store.load(interrupted.runId);
 		assert.equal(snapshot.threads?.coder?.nodes.includes("first"), true);
 		assert.equal(snapshot.threads?.coder?.nodes.includes("second"), true);
 		assert.match(snapshot.threads?.coder?.sessionId ?? "", /^[0-9a-f-]{36}$/i);
@@ -208,7 +470,7 @@ test("thread context refuses to silently reset a missing private session", async
 		const threadDir = join(directory, "threads");
 		const store = new FileCheckpointStore(checkpointDir);
 		const graph = compileGraph({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			name: "thread-missing",
 			entry: "worker",
 			nodes: {
@@ -247,7 +509,7 @@ test("thread context refuses to silently reset a missing private session", async
 		const executor = new PiNodeExecutor({ cwd: directory, hasUI: false, piCommand: fakePi, threadSessionsDir: threadDir });
 		const interrupted = await new GraphEngine(graph, executor, { checkpointStore: store }).run({ checkpoint: true });
 		assert.equal(interrupted.status, "interrupted");
-		const snapshot = await store.load(interrupted.runId);
+		const { snapshot } = await store.load(interrupted.runId);
 		const thread = snapshot.threads?.worker;
 		assert.ok(thread);
 		await rm(join(threadDir, interrupted.runId, `${thread.sessionId}.jsonl`));
@@ -266,7 +528,7 @@ test("thread context refuses to silently reset a missing private session", async
 
 test("shared context rejects malformed message state without retrying the agent", async () => {
 	const graph = compileGraph({
-		schemaVersion: 1,
+		schemaVersion: 2,
 		name: "shared-invalid-state",
 		entry: "worker",
 		initialState: { conversation: { messages: { invalid: true } } },
